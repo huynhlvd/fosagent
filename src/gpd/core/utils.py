@@ -1,0 +1,493 @@
+"""Shared utility functions for GPD.
+
+Layer 1 code: stdlib + pathlib + re only.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import tempfile
+import time
+import unicodedata
+from collections.abc import Hashable, Iterable, Iterator
+from contextlib import contextmanager
+from pathlib import Path
+from typing import TypeVar
+
+from gpd.core.constants import (
+    DEFAULT_MAX_INCLUDE_CHARS,
+    ENV_MAX_INCLUDE_CHARS,
+    PLAN_SUFFIX,
+    STANDALONE_PLAN,
+    STANDALONE_SUMMARY,
+    SUMMARY_SUFFIX,
+)
+
+try:
+    import fcntl
+except ModuleNotFoundError:  # pragma: no cover - exercised on Windows
+    fcntl = None
+
+try:
+    import msvcrt
+except ModuleNotFoundError:  # pragma: no cover - exercised on POSIX
+    msvcrt = None
+
+__all__ = [
+    "MAX_INCLUDE_CHARS",
+    "atomic_write",
+    "compare_phase_numbers",
+    "dedupe_preserve_order",
+    "file_lock",
+    "format_plan_duration",
+    "format_plan_label",
+    "generate_slug",
+    "is_canonical_plan_label",
+    "normalize_ascii_slug",
+    "is_phase_complete",
+    "matching_phase_artifact_count",
+    "phase_normalize",
+    "phase_artifact_id",
+    "phase_artifact_display_name",
+    "phase_sort_key",
+    "phase_unpad",
+    "safe_parse_int",
+    "strict_parse_int",
+    "safe_read_file",
+    "safe_read_file_truncated",
+]
+
+_HashableT = TypeVar("_HashableT", bound=Hashable)
+
+# ─── Phase Utilities ────────────────────────────────────────────────────────────
+
+
+def phase_normalize(name: str) -> str:
+    """Normalize a phase name by padding the top-level segment to 2 digits.
+
+    Sub-levels are NOT padded: "3.1.2" -> "03.1.2", "12" -> "12".
+    Non-numeric prefixes are returned as-is.
+    """
+    if name is None:
+        return ""
+    match = re.match(r"^(\d+(?:\.\d+)*)(.*)", name)
+    if not match:
+        return name
+    numeric, suffix = match.group(1), match.group(2)
+    parts = numeric.split(".")
+    normalized = []
+    for i, part in enumerate(parts):
+        try:
+            v = int(part)
+            normalized.append(str(v).zfill(2) if i == 0 else str(v))
+        except ValueError:
+            normalized.append(part)
+    return ".".join(normalized) + suffix
+
+
+def format_plan_label(phase: str | None, plan: str | None) -> str | None:
+    """Canonical rendering of the ``Phase NN PNN-KK`` metrics label.
+
+    Accepts the many shapes callers pass from executor returns:
+
+    - ``phase="01"``, ``plan="01-03"`` → ``"Phase 01 P01-03"``
+    - ``phase="1"``,  ``plan="03"``   → ``"Phase 01 P01-03"``
+    - ``phase="1"``,  ``plan="1-3"``  → ``"Phase 01 P01-03"``
+
+    Returns ``None`` when inputs cannot be normalized into a ``PNN-KK`` plan
+    token, so callers can reject malformed rows at write time.
+    """
+    if phase is None or plan is None:
+        return None
+    phase_str = str(phase).strip()
+    plan_str = str(plan).strip()
+    if not phase_str or not plan_str:
+        return None
+    phase_norm = phase_normalize(phase_str)
+
+    # Plan may be a bare index ("03"), a composite ("01-03" / "1-3"), or already
+    # prefixed ("P01-03").
+    if plan_str.lower().startswith("p"):
+        plan_str = plan_str[1:]
+    match = re.match(r"^(\d+)-(\d+)$", plan_str)
+    if match:
+        plan_phase = phase_normalize(match.group(1))
+        plan_index = str(int(match.group(2))).zfill(2)
+        if plan_phase != phase_norm:
+            return None
+        return f"Phase {phase_norm} P{plan_phase}-{plan_index}"
+    if plan_str.isdigit():
+        plan_index = str(int(plan_str)).zfill(2)
+        return f"Phase {phase_norm} P{phase_norm}-{plan_index}"
+    return None
+
+
+_PLAN_LABEL_RE = re.compile(r"^Phase\s+(\d+(?:\.\d+)*)\s+P(\d+(?:\.\d+)*)-(\d+)$")
+
+
+def is_canonical_plan_label(label: str) -> bool:
+    """Whether *label* matches the canonical ``Phase NN PNN-KK`` format."""
+    return bool(_PLAN_LABEL_RE.match(label.strip())) if label else False
+
+
+def format_plan_duration(value: object) -> str:
+    """Render an executor-supplied duration with a sub-second floor.
+
+    Accepts raw integers, floats, "12s", "1.5s", or already-formatted "12m30s".
+    Sub-second work is rendered ``"<1s"`` instead of ``"0s"`` so the dashboard
+    is honest about completed-but-brief plans.
+    """
+    if value is None:
+        return "-"
+    text = str(value).strip()
+    if not text:
+        return "-"
+    # Raw int/float seconds.
+    try:
+        seconds = float(text)
+    except ValueError:
+        seconds = None
+    if seconds is None:
+        m = re.match(r"^(\d+(?:\.\d+)?)s$", text)
+        if m:
+            seconds = float(m.group(1))
+    if seconds is None:
+        return text
+    if seconds < 0:
+        return "-"
+    if seconds < 1:
+        return "<1s"
+    return f"{int(round(seconds))}s"
+
+
+def phase_unpad(name: str) -> str:
+    """Strip leading zeros from each segment of a phase number.
+
+    Returns the "display" form: "08.1.1" -> "8.1.1".
+    Preserves all decimal levels.
+    """
+    if name is None:
+        return ""
+    match = re.match(r"^(\d+(?:\.\d+)*)(.*)", name)
+    if not match:
+        return name
+    numeric, suffix = match.group(1), match.group(2)
+    parts = numeric.split(".")
+    unpadded = []
+    for part in parts:
+        try:
+            unpadded.append(str(int(part)))
+        except ValueError:
+            unpadded.append(part)
+    return ".".join(unpadded) + suffix
+
+
+def compare_phase_numbers(a: str, b: str) -> int:
+    """Compare two phase number strings segment-by-segment.
+
+    Handles multi-level decimals: "2.1.2" < "2.1.10".
+    Returns negative if a < b, 0 if equal, positive if a > b.
+    """
+    if a is None:
+        a = ""
+    if b is None:
+        b = ""
+    a_match = re.match(r"^(\d+(?:\.\d+)*)", a)
+    b_match = re.match(r"^(\d+(?:\.\d+)*)", b)
+    a_parts = (a_match.group(1) if a_match else "0").split(".")
+    b_parts = (b_match.group(1) if b_match else "0").split(".")
+    length = max(len(a_parts), len(b_parts))
+    for i in range(length):
+        a_val = int(a_parts[i]) if i < len(a_parts) else 0
+        b_val = int(b_parts[i]) if i < len(b_parts) else 0
+        if a_val != b_val:
+            return a_val - b_val
+    # Fall back to lexicographic comparison of non-numeric suffixes only
+    a_suffix = a[a_match.end():] if a_match else a
+    b_suffix = b[b_match.end():] if b_match else b
+    if a_suffix < b_suffix:
+        return -1
+    if a_suffix > b_suffix:
+        return 1
+    return 0
+
+
+def is_phase_complete(plan_count: int, summary_count: int) -> bool:
+    """A phase is complete when it has at least one plan and every plan has a summary."""
+    return plan_count > 0 and summary_count >= plan_count
+
+
+def phase_artifact_id(filename: str, suffix: str, standalone: str) -> str:
+    """Return the comparison key for a phase artifact filename."""
+    if filename == standalone:
+        return ""
+    if filename.endswith(suffix):
+        return filename[: -len(suffix)]
+    return filename
+
+
+def phase_artifact_display_name(identifier: str, standalone: str) -> str:
+    """Return the user-facing name for a phase artifact identity."""
+    return standalone if not identifier or identifier == "_standalone" else identifier
+
+
+def matching_phase_artifact_count(plan_files: Iterable[str], summary_files: Iterable[str]) -> int:
+    """Return how many plans have a matching summary by artifact identity."""
+    plan_ids = {phase_artifact_id(filename, PLAN_SUFFIX, STANDALONE_PLAN) for filename in plan_files}
+    summary_ids = {phase_artifact_id(filename, SUMMARY_SUFFIX, STANDALONE_SUMMARY) for filename in summary_files}
+    return len(plan_ids & summary_ids)
+
+
+def phase_sort_key(name: str) -> list[int]:
+    """Sort key for phase directory names by numeric segments.
+
+    "03-setup" -> [3], "2.1-derive" -> [2, 1].
+    """
+    if name is None:
+        return [999999]
+    match = re.match(r"^(\d+(?:\.\d+)*)", name)
+    if not match:
+        return [999999]
+    return [int(s) for s in match.group(1).split(".")]
+
+
+# ─── Text Utilities ─────────────────────────────────────────────────────────────
+
+
+def generate_slug(text: str) -> str | None:
+    """Generate a URL-safe slug from text.
+
+    "Hello World!" -> "hello-world", "" -> None.
+    """
+    return normalize_ascii_slug(text)
+
+
+def normalize_ascii_slug(value: object) -> str | None:
+    """Generate a lowercase ASCII slug from arbitrary text.
+
+    Unicode input is normalized, stripped to ASCII, and collapsed to
+    hyphen-separated tokens. Empty output returns ``None``.
+    """
+    if value is None:
+        return None
+    normalized = unicodedata.normalize("NFKD", str(value).strip().casefold())
+    ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+    slug = re.sub(r"[^a-z0-9]+", "-", ascii_text)
+    slug = re.sub(r"-+", "-", slug).strip("-")
+    return slug or None
+
+
+def dedupe_preserve_order(values: Iterable[_HashableT]) -> list[_HashableT]:
+    """Return unique values in first-seen order."""
+    deduped: list[_HashableT] = []
+    seen: set[_HashableT] = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
+
+
+def safe_parse_int(value: object, default: int | None = 0) -> int | None:
+    """Parse an integer safely, returning *default* if invalid.
+
+    Unlike int(), never raises on bad input.  When *default* is ``None``
+    the caller can distinguish "not a number" from a real zero. This helper is
+    intentionally permissive for non-authoritative inputs such as env vars and
+    best-effort CLI formatting.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float)):
+        return int(value)
+    try:
+        return int(str(value))
+    except (ValueError, TypeError):
+        return default
+
+
+_STRICT_INT_RE = re.compile(r"^[+-]?\d+$")
+
+
+def strict_parse_int(value: object, default: int | None = 0) -> int | None:
+    """Parse an integer without coercing booleans, floats, or decimal strings.
+
+    This helper is for authoritative contract/state/frontmatter boundaries where
+    silent coercion is more harmful than a rejected field.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return default
+    if isinstance(value, int):
+        return value
+    if not isinstance(value, str):
+        return default
+    normalized = value.strip()
+    if not normalized or not _STRICT_INT_RE.fullmatch(normalized):
+        return default
+    try:
+        return int(normalized)
+    except ValueError:
+        return default
+
+
+
+# ─── File Helpers ───────────────────────────────────────────────────────────────
+
+
+def _max_include_chars_from_env() -> int:
+    """Return a valid include limit from the environment or the default."""
+    parsed = safe_parse_int(os.environ.get(ENV_MAX_INCLUDE_CHARS), DEFAULT_MAX_INCLUDE_CHARS)
+    if parsed is None or parsed <= 0:
+        return DEFAULT_MAX_INCLUDE_CHARS
+    return parsed
+
+
+# Maximum characters to include when reading files for context
+MAX_INCLUDE_CHARS = _max_include_chars_from_env()
+
+
+def safe_read_file(path: Path) -> str | None:
+    """Read a file, returning None if it doesn't exist, is a directory, or can't be read."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except (FileNotFoundError, IsADirectoryError, PermissionError, UnicodeDecodeError, OSError):
+        return None
+
+
+def safe_read_file_truncated(path: Path, max_chars: int | None = None) -> str | None:
+    """Read a file, truncating if it exceeds max_chars."""
+    content = safe_read_file(path)
+    if content is None:
+        return None
+    limit = max_chars if max_chars is not None else MAX_INCLUDE_CHARS
+    if len(content) <= limit:
+        return content
+    return content[:limit] + f"\n\n...truncated ({len(content)} chars total, showing first {limit})."
+
+
+def _replace_with_retry(
+    src: str | Path,
+    dst: str | Path,
+    *,
+    max_attempts: int = 5,
+) -> None:
+    """Perform ``os.replace(src, dst)`` with retry for Dropbox/sync delays.
+
+    On Windows, cloud-sync tools (Dropbox, OneDrive) may hold a brief lock on
+    the destination file.  Retrying with exponential back-off (100-1600 ms)
+    avoids transient ``PermissionError`` without masking real failures.
+    """
+    for attempt in range(max_attempts):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == max_attempts - 1:
+                raise
+            time.sleep(0.1 * (2 ** attempt))  # 100, 200, 400, 800, 1600 ms
+
+
+def atomic_write(filepath: Path, content: str) -> None:
+    """Write a file atomically via temp file + fsync + rename.
+
+    Ensures the file is either fully written or not modified at all.
+    """
+    parent = filepath.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    fd = None
+    tmp_path = None
+    try:
+        fd_int, tmp_path = tempfile.mkstemp(dir=parent, prefix=".tmp_", suffix=".tmp")
+        fd = os.fdopen(fd_int, "w", encoding="utf-8")
+        fd.write(content)
+        fd.flush()
+        os.fsync(fd.fileno())
+        fd.close()
+        fd = None
+        _replace_with_retry(tmp_path, filepath)
+        tmp_path = None
+    finally:
+        if fd is not None:
+            fd.close()
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def _ensure_windows_lock_region(lock_fd: object) -> None:
+    """Guarantee a 1-byte region exists for msvcrt byte-range locking."""
+    if msvcrt is None:
+        return
+    lock_fd.seek(0, os.SEEK_END)
+    if lock_fd.tell() == 0:
+        lock_fd.write(b"\0")
+        lock_fd.flush()
+    lock_fd.seek(0)
+
+
+def _acquire_file_lock_nonblocking(lock_fd: object) -> None:
+    """Acquire an exclusive non-blocking lock using the active platform backend."""
+    if fcntl is not None:
+        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return
+    if msvcrt is not None:
+        _ensure_windows_lock_region(lock_fd)
+        msvcrt.locking(lock_fd.fileno(), msvcrt.LK_NBLCK, 1)
+        return
+    raise RuntimeError("No supported file-locking backend is available on this platform")
+
+
+def _release_file_lock(lock_fd: object) -> None:
+    """Release a lock using the active platform backend."""
+    if fcntl is not None:
+        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+        return
+    if msvcrt is not None:
+        _ensure_windows_lock_region(lock_fd)
+        msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+    raise RuntimeError("No supported file-locking backend is available on this platform")
+
+
+@contextmanager
+def file_lock(path: Path, timeout: float = 5.0) -> Iterator[None]:
+    """Context manager for cross-platform exclusive file locking.
+
+    Usage:
+        with file_lock(some_path):
+            # exclusive access to some_path
+
+    The sidecar lockfile is intentionally durable.  Unlinking it on release can
+    let a racing process recreate and lock a different inode while another
+    waiter still holds an open descriptor to the original lockfile.
+    """
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = None
+    try:
+        lock_fd = open(lock_path, "a+b")  # noqa: SIM115
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                _acquire_file_lock_nonblocking(lock_fd)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"Timeout acquiring lock on {path}") from None
+                time.sleep(0.05)
+        yield
+    finally:
+        if lock_fd is not None:
+            try:
+                _release_file_lock(lock_fd)
+            except OSError:
+                pass
+            lock_fd.close()

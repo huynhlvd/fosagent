@@ -1,0 +1,701 @@
+"""Behavior-focused paper assertions."""
+
+from __future__ import annotations
+
+import hashlib
+import re
+from pathlib import Path
+
+import pytest
+from pydantic import ValidationError
+
+
+def test_prl_and_apj_skip_empty_affiliations() -> None:
+    from gpd.mcp.paper.models import Author, PaperConfig, Section
+    from gpd.mcp.paper.template_registry import render_paper
+
+    prl = PaperConfig(
+        title="Test Paper",
+        authors=[Author(name="John Doe", email="john@example.com", affiliation="")],
+        abstract="Test abstract.",
+        sections=[Section(title="Introduction", content="Hello.")],
+        journal="prl",
+    )
+    apj = PaperConfig(
+        title="Test Paper",
+        authors=[Author(name="Jane Doe", affiliation="")],
+        abstract="Abstract.",
+        sections=[Section(title="Intro", content="Content.")],
+        journal="apj",
+    )
+
+    assert "\\affiliation{}" not in render_paper(prl)
+    assert "\\affiliation{}" not in render_paper(apj)
+
+
+def test_mnras_running_header_uses_author_names() -> None:
+    from gpd.mcp.paper.models import Author, PaperConfig, Section
+    from gpd.mcp.paper.template_registry import render_paper
+
+    config = PaperConfig(
+        title="Test Paper",
+        authors=[
+            Author(name="Alice Smith", affiliation="MIT"),
+            Author(name="Bob Jones", affiliation="Stanford"),
+            Author(name="Carol White", affiliation="Caltech"),
+        ],
+        abstract="Test abstract.",
+        sections=[Section(title="Introduction", content="Hello.")],
+        journal="mnras",
+    )
+
+    tex = render_paper(config)
+    match = re.search(r"\\author\[([^\]]*)\]", tex)
+
+    assert match is not None
+    assert "Alice Smith, Bob Jones, Carol White" in match.group(1)
+
+
+def test_templates_handle_empty_authors_without_dangling_breaks() -> None:
+    from gpd.mcp.paper.models import PaperConfig, Section
+    from gpd.mcp.paper.template_registry import render_paper
+
+    mnras = PaperConfig(
+        title="Test Paper",
+        authors=[],
+        abstract="Abstract.",
+        sections=[Section(title="Intro", content="Content.")],
+        journal="mnras",
+    )
+    nature = PaperConfig(
+        title="Test Paper",
+        authors=[],
+        abstract="Abstract.",
+        sections=[Section(title="Intro", content="Content.")],
+        journal="nature",
+    )
+
+    mnras_tex = render_paper(mnras)
+    mnras_match = re.search(r"\\author\[]\{(.*?)\}", mnras_tex, re.DOTALL)
+    assert mnras_match is not None
+    assert "\\\\" not in mnras_match.group(1).strip()
+
+    nature_tex = render_paper(nature)
+    nature_match = re.search(r"\\author\{(.*?)\}", nature_tex, re.DOTALL)
+    assert nature_match is not None
+    assert "\\\\[6pt]" not in nature_match.group(1).strip()
+
+
+def test_render_paper_injects_required_acknowledgment_even_if_validation_was_bypassed() -> None:
+    from gpd.mcp.paper.models import REQUIRED_GPD_ACKNOWLEDGMENT, Author, PaperConfig, Section
+    from gpd.mcp.paper.template_registry import render_paper
+
+    config = PaperConfig.model_construct(
+        title="Constructed Paper",
+        authors=[Author(name="Jane Doe")],
+        abstract="Abstract.",
+        sections=[Section(title="Intro", content="Content.")],
+        figures=[],
+        acknowledgments="",
+        bib_file="references",
+        journal="prl",
+        appendix_sections=[],
+        attribution_footer="Generated with Get Physics Done",
+        output_filename=None,
+    )
+
+    tex = render_paper(config)
+    assert REQUIRED_GPD_ACKNOWLEDGMENT in tex
+
+
+def test_build_artifact_manifest_captures_tex_and_optional_bib(tmp_path) -> None:
+    from gpd.mcp.paper.artifact_manifest import build_artifact_manifest
+    from gpd.mcp.paper.models import Author, PaperConfig, Section
+
+    tex_path = tmp_path / "paper.tex"
+    tex_path.write_text(
+        "\\documentclass{article}\\begin{document}\\bibliography{refs}\\end{document}", encoding="utf-8"
+    )
+    bib_path = tmp_path / "refs.bib"
+    bib_path.write_text("@article{test2024, author={Test}, title={Title}, year={2024}}", encoding="utf-8")
+
+    config = PaperConfig(
+        title="Test Paper",
+        authors=[Author(name="Test Author", affiliation="Test Univ")],
+        abstract="Abstract text.",
+        sections=[Section(title="Intro", content="Content")],
+        journal="mnras",
+    )
+
+    manifest = build_artifact_manifest(config, tmp_path, tex_path=tex_path, bib_path=bib_path)
+
+    tex_artifact = next(artifact for artifact in manifest.artifacts if artifact.artifact_id == "tex-paper")
+    assert len(tex_artifact.sha256) == 64
+    assert any(artifact.category == "bib" for artifact in manifest.artifacts)
+
+
+def test_build_artifact_manifest_captures_manuscript_freshness_fields(tmp_path) -> None:
+    from gpd.mcp.paper.artifact_manifest import build_artifact_manifest
+    from gpd.mcp.paper.models import Author, PaperConfig, Section
+
+    tex_path = tmp_path / "paper.tex"
+    tex_content = "\\documentclass{article}\\begin{document}Fresh snapshot.\\end{document}"
+    tex_path.write_text(tex_content, encoding="utf-8")
+
+    config = PaperConfig(
+        title="Fresh Manifest",
+        authors=[Author(name="Test Author", affiliation="Test Univ")],
+        abstract="Abstract text.",
+        sections=[Section(title="Intro", content="Content")],
+        journal="jhep",
+    )
+
+    manifest = build_artifact_manifest(config, tmp_path, tex_path=tex_path)
+
+    assert manifest.manuscript_sha256 == hashlib.sha256(tex_content.encode("utf-8")).hexdigest()
+    assert manifest.manuscript_mtime_ns == tex_path.stat().st_mtime_ns
+
+
+def test_artifact_manifest_freshness_validation_rejects_edited_manuscript(tmp_path) -> None:
+    from gpd.mcp.paper.artifact_manifest import build_artifact_manifest, validate_artifact_manifest_freshness
+    from gpd.mcp.paper.models import Author, PaperConfig, Section
+
+    tex_path = tmp_path / "paper.tex"
+    tex_path.write_text("\\documentclass{article}\\begin{document}Original.\\end{document}", encoding="utf-8")
+    config = PaperConfig(
+        title="Fresh Manifest",
+        authors=[Author(name="Test Author", affiliation="Test Univ")],
+        abstract="Abstract text.",
+        sections=[Section(title="Intro", content="Content")],
+        journal="jhep",
+    )
+    manifest = build_artifact_manifest(config, tmp_path, tex_path=tex_path)
+    tex_path.write_text("\\documentclass{article}\\begin{document}Edited.\\end{document}", encoding="utf-8")
+
+    freshness = validate_artifact_manifest_freshness(manifest, tex_path)
+
+    assert freshness.fresh is False
+    assert freshness.actual_sha256 == hashlib.sha256(tex_path.read_bytes()).hexdigest()
+    assert freshness.detail == "manuscript_sha256 does not match the active manuscript snapshot"
+
+
+def test_artifact_manifest_freshness_validation_rejects_missing_manuscript_sha256(tmp_path) -> None:
+    from gpd.mcp.paper.artifact_manifest import validate_artifact_manifest_freshness
+    from gpd.mcp.paper.models import ArtifactManifest
+
+    tex_path = tmp_path / "paper.tex"
+    tex_path.write_text("\\documentclass{article}\\begin{document}Current.\\end{document}", encoding="utf-8")
+    manifest = ArtifactManifest.model_validate(
+        {
+            "version": 1,
+            "paper_title": "Legacy Manifest",
+            "journal": "jhep",
+            "created_at": "2026-04-04T12:00:00+00:00",
+            "artifacts": [
+                {
+                    "artifact_id": "tex-paper",
+                    "category": "tex",
+                    "path": "paper.tex",
+                    "sha256": hashlib.sha256(b"stale").hexdigest(),
+                    "produced_by": "test",
+                }
+            ],
+        }
+    )
+
+    freshness = validate_artifact_manifest_freshness(manifest, tex_path)
+
+    assert freshness.fresh is False
+    assert freshness.detail == "manifest is missing manuscript_sha256; freshness cannot be verified"
+
+
+def test_artifact_manifest_models_reject_extra_fields_and_invalid_sha256() -> None:
+    from gpd.mcp.paper.models import ArtifactManifest
+
+    with pytest.raises(ValidationError):
+        ArtifactManifest.model_validate(
+            {
+                "version": 1,
+                "paper_title": "Strict Manifest",
+                "journal": "prl",
+                "created_at": "2026-03-17T00:00:00+00:00",
+                "artifacts": [
+                    {
+                        "artifact_id": "tex-paper",
+                        "category": "tex",
+                        "path": "paper.tex",
+                        "sha256": "deadbeef",
+                        "produced_by": "build_paper:render_tex",
+                        "unexpected": "boom",
+                    }
+                ],
+            }
+        )
+
+
+def test_artifact_manifest_rejects_unsupported_builder_journal() -> None:
+    from gpd.mcp.paper.models import ArtifactManifest
+
+    with pytest.raises(ValidationError, match="journal"):
+        ArtifactManifest.model_validate(
+            {
+                "version": 1,
+                "paper_title": "Strict Manifest",
+                "journal": "prd",
+                "created_at": "2026-03-17T00:00:00+00:00",
+                "artifacts": [],
+            }
+        )
+
+
+def test_artifact_manifest_models_reject_blank_titles_and_invalid_timestamps() -> None:
+    from gpd.mcp.paper.models import ArtifactManifest
+
+    with pytest.raises(ValidationError, match=r"paper_title[\s\S]*non-empty string"):
+        ArtifactManifest.model_validate(
+            {
+                "version": 1,
+                "paper_title": "   ",
+                "journal": "prl",
+                "created_at": "2026-03-17T00:00:00+00:00",
+                "artifacts": [],
+            }
+        )
+
+    with pytest.raises(ValidationError, match=r"created_at[\s\S]*ISO 8601 timestamp"):
+        ArtifactManifest.model_validate(
+            {
+                "version": 1,
+                "paper_title": "Strict Manifest",
+                "journal": "prl",
+                "created_at": "not-a-timestamp",
+                "artifacts": [],
+            }
+        )
+
+
+@pytest.mark.parametrize("field_name", ["artifact_id", "path", "produced_by"])
+def test_artifact_manifest_models_reject_blank_critical_artifact_record_fields(field_name: str) -> None:
+    from gpd.mcp.paper.models import ArtifactManifest
+
+    artifact = {
+        "artifact_id": "tex-paper",
+        "category": "tex",
+        "path": "paper.tex",
+        "sha256": "0" * 64,
+        "produced_by": "build_paper:render_tex",
+    }
+    artifact[field_name] = "   "
+
+    with pytest.raises(ValidationError, match=r"non-empty string"):
+        ArtifactManifest.model_validate(
+            {
+                "version": 1,
+                "paper_title": "Strict Manifest",
+                "journal": "prl",
+                "created_at": "2026-03-17T00:00:00+00:00",
+                "artifacts": [artifact],
+            }
+        )
+
+
+def test_artifact_manifest_models_reject_blank_source_paths() -> None:
+    from gpd.mcp.paper.models import ArtifactManifest
+
+    with pytest.raises(ValidationError, match=r"sources\[\]\.path[\s\S]*non-empty string"):
+        ArtifactManifest.model_validate(
+            {
+                "version": 1,
+                "paper_title": "Strict Manifest",
+                "journal": "prl",
+                "created_at": "2026-03-17T00:00:00+00:00",
+                "artifacts": [
+                    {
+                        "artifact_id": "figure-benchmark",
+                        "category": "figure",
+                        "path": "figures/benchmark.pdf",
+                        "sha256": "0" * 64,
+                        "produced_by": "build_paper:prepare_figures",
+                        "sources": [{"path": "   ", "role": "source-figure"}],
+                    }
+                ],
+            }
+        )
+
+
+def test_artifact_manifest_models_reject_duplicate_artifact_ids() -> None:
+    from gpd.mcp.paper.models import ArtifactManifest
+
+    with pytest.raises(ValidationError, match=r"repeat artifact_id values: tex-paper"):
+        ArtifactManifest.model_validate(
+            {
+                "version": 1,
+                "paper_title": "Strict Manifest",
+                "journal": "prl",
+                "created_at": "2026-03-17T00:00:00+00:00",
+                "artifacts": [
+                    {
+                        "artifact_id": "tex-paper",
+                        "category": "tex",
+                        "path": "paper.tex",
+                        "sha256": "0" * 64,
+                        "produced_by": "build_paper:render_tex",
+                    },
+                    {
+                        "artifact_id": "tex-paper",
+                        "category": "tex",
+                        "path": "paper-copy.tex",
+                        "sha256": "1" * 64,
+                        "produced_by": "build_paper:render_tex",
+                    },
+                ],
+            }
+        )
+
+
+def test_artifact_manifest_models_reject_duplicate_category_path_records() -> None:
+    from gpd.mcp.paper.models import ArtifactManifest
+
+    with pytest.raises(ValidationError, match=r"same category\+path records: tex:paper.tex"):
+        ArtifactManifest.model_validate(
+            {
+                "version": 1,
+                "paper_title": "Strict Manifest",
+                "journal": "prl",
+                "created_at": "2026-03-17T00:00:00+00:00",
+                "artifacts": [
+                    {
+                        "artifact_id": "tex-paper",
+                        "category": "tex",
+                        "path": "paper.tex",
+                        "sha256": "0" * 64,
+                        "produced_by": "build_paper:render_tex",
+                    },
+                    {
+                        "artifact_id": "tex-paper-duplicate",
+                        "category": "tex",
+                        "path": "paper.tex",
+                        "sha256": "1" * 64,
+                        "produced_by": "build_paper:render_tex",
+                    },
+                ],
+            }
+        )
+
+
+def test_artifact_manifest_schema_documents_external_source_redaction() -> None:
+    schema_text = Path("src/gpd/specs/templates/paper/artifact-manifest-schema.md").read_text(encoding="utf-8")
+
+    assert "external:<name>" in schema_text
+
+
+def test_build_artifact_manifest_makes_output_local_absolute_source_paths_portable(tmp_path) -> None:
+    from gpd.mcp.paper.artifact_manifest import build_artifact_manifest
+    from gpd.mcp.paper.models import Author, FigureRef, PaperConfig, Section
+
+    output_dir = tmp_path / "paper"
+    source_dir = output_dir / "sources"
+    source_dir.mkdir(parents=True)
+    original_path = source_dir / "input-figure.pdf"
+    original_path.write_text("source figure", encoding="utf-8")
+
+    prepared_dir = output_dir / "figures"
+    prepared_dir.mkdir()
+    prepared_path = prepared_dir / "prepared-figure.pdf"
+    prepared_path.write_text("prepared figure", encoding="utf-8")
+
+    tex_path = output_dir / "paper.tex"
+    tex_path.write_text("\\documentclass{article}\\begin{document}\\end{document}", encoding="utf-8")
+
+    config = PaperConfig(
+        title="Portable Manifest",
+        authors=[Author(name="Test Author", affiliation="Test Univ")],
+        abstract="Abstract text.",
+        sections=[Section(title="Intro", content="Content")],
+        journal="jhep",
+    )
+
+    manifest = build_artifact_manifest(
+        config,
+        output_dir,
+        tex_path=tex_path,
+        figure_source_pairs=[
+            (
+                FigureRef(path=original_path, caption="Source", label="source"),
+                FigureRef(path=Path("figures/prepared-figure.pdf"), caption="Prepared", label="prepared"),
+            )
+        ],
+    )
+
+    figure_artifact = next(artifact for artifact in manifest.artifacts if artifact.category == "figure")
+    assert figure_artifact.sources[0].path == "sources/input-figure.pdf"
+    assert figure_artifact.sources[0].role == "source-figure"
+
+
+def test_build_artifact_manifest_classifies_external_absolute_source_paths(tmp_path) -> None:
+    from gpd.mcp.paper.artifact_manifest import build_artifact_manifest
+    from gpd.mcp.paper.models import Author, FigureRef, PaperConfig, Section
+
+    output_dir = tmp_path / "paper"
+    output_dir.mkdir()
+    external_dir = tmp_path / "external-sources"
+    external_dir.mkdir()
+    original_path = external_dir / "input-figure.pdf"
+    original_path.write_text("source figure", encoding="utf-8")
+    prepared_dir = output_dir / "figures"
+    prepared_dir.mkdir()
+    (prepared_dir / "prepared-figure.pdf").write_text("prepared figure", encoding="utf-8")
+    tex_path = output_dir / "paper.tex"
+    tex_path.write_text("\\documentclass{article}\\begin{document}\\end{document}", encoding="utf-8")
+    config = PaperConfig(
+        title="External Source Manifest",
+        authors=[Author(name="Test Author", affiliation="Test Univ")],
+        abstract="Abstract text.",
+        sections=[Section(title="Intro", content="Content")],
+        journal="jhep",
+    )
+
+    manifest = build_artifact_manifest(
+        config,
+        output_dir,
+        tex_path=tex_path,
+        figure_source_pairs=[
+            (
+                FigureRef(path=original_path, caption="Source", label="source"),
+                FigureRef(path=Path("figures/prepared-figure.pdf"), caption="Prepared", label="prepared"),
+            )
+        ],
+    )
+
+    source = next(artifact for artifact in manifest.artifacts if artifact.category == "figure").sources[0]
+    assert source.path == "external:input-figure.pdf"
+    assert source.role == "external-source-figure"
+    assert tmp_path.as_posix() not in source.path
+
+
+def test_build_artifact_manifest_makes_cwd_local_absolute_source_paths_portable(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gpd.mcp.paper.artifact_manifest import build_artifact_manifest
+    from gpd.mcp.paper.models import Author, FigureRef, PaperConfig, Section
+
+    project_root = tmp_path / "project"
+    output_dir = project_root / "GPD" / "publication" / "paper"
+    source_dir = project_root / "assets"
+    prepared_dir = output_dir / "figures"
+    source_dir.mkdir(parents=True)
+    prepared_dir.mkdir(parents=True)
+    original_path = source_dir / "input-figure.pdf"
+    original_path.write_text("source figure", encoding="utf-8")
+    (prepared_dir / "prepared-figure.pdf").write_text("prepared figure", encoding="utf-8")
+    tex_path = output_dir / "paper.tex"
+    tex_path.write_text("\\documentclass{article}\\begin{document}\\end{document}", encoding="utf-8")
+    monkeypatch.chdir(project_root)
+    config = PaperConfig(
+        title="Project Source Manifest",
+        authors=[Author(name="Test Author", affiliation="Test Univ")],
+        abstract="Abstract text.",
+        sections=[Section(title="Intro", content="Content")],
+        journal="jhep",
+    )
+
+    manifest = build_artifact_manifest(
+        config,
+        output_dir,
+        tex_path=tex_path,
+        figure_source_pairs=[
+            (
+                FigureRef(path=original_path, caption="Source", label="source"),
+                FigureRef(path=Path("figures/prepared-figure.pdf"), caption="Prepared", label="prepared"),
+            )
+        ],
+    )
+
+    source = next(artifact for artifact in manifest.artifacts if artifact.category == "figure").sources[0]
+    assert source.path == "assets/input-figure.pdf"
+    assert source.role == "source-figure"
+
+
+def test_build_artifact_manifest_skips_prepared_figures_outside_output_dir(tmp_path) -> None:
+    from gpd.mcp.paper.artifact_manifest import build_artifact_manifest
+    from gpd.mcp.paper.models import Author, FigureRef, PaperConfig, Section
+
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    tex_path = output_dir / "paper.tex"
+    tex_path.write_text("\\documentclass{article}\\begin{document}\\end{document}", encoding="utf-8")
+    outside_path = tmp_path / "outside-prepared-figure.pdf"
+    outside_path.write_text("outside prepared figure", encoding="utf-8")
+
+    config = PaperConfig(
+        title="Contained Manifest",
+        authors=[Author(name="Test Author", affiliation="Test Univ")],
+        abstract="Abstract text.",
+        sections=[Section(title="Intro", content="Content")],
+        journal="jhep",
+    )
+
+    manifest = build_artifact_manifest(
+        config,
+        output_dir,
+        tex_path=tex_path,
+        figure_source_pairs=[
+            (
+                FigureRef(path=tmp_path / "source.pdf", caption="Source", label="source"),
+                FigureRef(path=outside_path, caption="Prepared", label="prepared"),
+            )
+        ],
+    )
+
+    assert all(artifact.category != "figure" for artifact in manifest.artifacts)
+
+
+def test_prepare_figures_returns_relative_paths(tmp_path) -> None:
+    from PIL import Image
+
+    from gpd.mcp.paper.figures import prepare_figures
+    from gpd.mcp.paper.models import FigureRef
+
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    Image.new("RGB", (100, 100)).save(input_dir / "fig.png")
+
+    output_dir = tmp_path / "output"
+    figures = [FigureRef(path=input_dir / "fig.png", caption="Test", label="test")]
+    result, errors = prepare_figures(figures, output_dir, "prl")
+
+    assert errors == []
+    assert len(result) == 1
+    assert result[0].path.is_absolute() is False
+    assert (output_dir / result[0].path).exists()
+
+
+def test_tiff_conversion_removes_partial_png_when_pillow_save_fails(tmp_path, monkeypatch) -> None:
+    from PIL import Image
+
+    from gpd.mcp.paper.figures import _convert_tiff
+
+    source = tmp_path / "input" / "figure.tiff"
+    source.parent.mkdir()
+    source.write_bytes(b"placeholder")
+    output_dir = tmp_path / "output"
+    partial_png = output_dir / "figure.png"
+
+    class FailingImage:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def save(self, dest, fmt):
+            assert fmt == "PNG"
+            dest = Path(dest)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"partial png")
+            raise OSError("simulated Pillow save failure")
+
+    def fake_open(path):
+        assert path == source
+        return FailingImage()
+
+    monkeypatch.setattr(Image, "open", fake_open)
+
+    with pytest.raises(OSError, match="simulated Pillow save failure"):
+        _convert_tiff(source, output_dir)
+
+    assert not partial_png.exists()
+
+
+def test_passthrough_conversion_removes_partial_copy_when_copy_fails(tmp_path, monkeypatch) -> None:
+    from gpd.mcp.paper.figures import normalize_figure
+
+    source = tmp_path / "input" / "figure.png"
+    source.parent.mkdir()
+    source.write_bytes(b"complete png")
+    output_dir = tmp_path / "output"
+    partial_png = output_dir / "figure.png"
+
+    def partial_copy(_source: Path, dest: Path) -> None:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(b"partial png")
+        raise OSError("simulated partial copy")
+
+    monkeypatch.setattr("gpd.mcp.paper.figures.shutil.copy2", partial_copy)
+
+    with pytest.raises(OSError, match="simulated partial copy"):
+        normalize_figure(source, output_dir)
+
+    assert not partial_png.exists()
+
+
+def test_render_paper_cleans_title_fences() -> None:
+    from gpd.mcp.paper.models import PaperConfig, Section
+    from gpd.mcp.paper.template_registry import render_paper
+
+    rendered = render_paper(
+        PaperConfig(
+            journal="prl",
+            title="```My Test Paper```",
+            authors=[],
+            abstract="Abstract text",
+            sections=[Section(title="Intro", content="Body text")],
+        )
+    )
+
+    assert "```" not in rendered
+    assert "My Test Paper" in rendered
+
+
+def test_render_paper_cleans_fenced_author_section_appendix_and_caption_fields() -> None:
+    from pathlib import Path
+
+    from gpd.mcp.paper.models import Author, FigureRef, PaperConfig, Section
+    from gpd.mcp.paper.template_registry import render_paper
+
+    rendered = render_paper(
+        PaperConfig(
+            journal="prl",
+            title="Paper",
+            authors=[Author(name="```Alice Example```", email="```alice@example.com```", affiliation="```MIT```")],
+            abstract="Abstract text",
+            sections=[Section(title="```Intro```", content="Body text")],
+            appendix_sections=[Section(title="```Appendix A```", content="Appendix text")],
+            figures=[FigureRef(path=Path("figures/fig01.pdf"), caption="```Velocity caption```", label="velocity")],
+        )
+    )
+
+    assert "```" not in rendered
+    assert "\\author{Alice Example}" in rendered
+    assert "\\email{alice@example.com}" in rendered
+    assert "\\affiliation{MIT}" in rendered
+    assert "\\section{Intro}" in rendered
+    assert "\\section{Appendix A}" in rendered
+    assert "\\caption{Velocity caption}" in rendered
+
+
+def test_latex_autofix_preserves_documentclass_and_texttt_underscores() -> None:
+    from gpd.utils.latex import _fix_unbalanced_braces, _fix_unescaped_underscores
+
+    broken_doc = "\\documentclass{article}\n\\begin{document}\nHello}\n\\end{document}"
+    texttt_doc = "The variable \\texttt{my_var} is important."
+
+    assert not _fix_unbalanced_braces(broken_doc).startswith("{\\documentclass")
+    assert "\\texttt{my_var}" in _fix_unescaped_underscores(texttt_doc)
+
+
+def test_clean_latex_fences_leaves_unmatched_fences_unchanged() -> None:
+    from gpd.utils.latex import clean_latex_fences
+
+    content = "Some text ```latex\\section{Intro} and no closing fence"
+
+    assert clean_latex_fences(content) == content
+
+
+def test_journal_spec_is_exported_from_paper_package() -> None:
+    import gpd.mcp.paper as paper_pkg
+    from gpd.mcp.paper import JournalSpec
+
+    assert JournalSpec is not None
+    assert "JournalSpec" in paper_pkg.__all__

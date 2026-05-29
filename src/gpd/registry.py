@@ -1,0 +1,1889 @@
+"""GPD content registry — canonical source for commands and agents.
+
+Primary GPD commands and agents live in markdown files with YAML frontmatter.
+This module parses them once, caches the results, and exposes typed dataclass
+definitions so shared consumers can project runtime-specific install or
+discovery surfaces without re-parsing the canonical content.
+"""
+
+from __future__ import annotations
+
+import re
+import textwrap
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from functools import lru_cache
+from pathlib import Path
+
+import yaml
+
+from gpd.adapters.install_utils import expand_at_includes
+from gpd.command_labels import (
+    canonical_command_label,
+    canonical_skill_label,
+    command_slug_from_label,
+    parse_command_label,
+)
+from gpd.core import registry_command_policy as _registry_command_policy
+from gpd.core.agent_role_kits import (
+    AGENT_ROLE_KITS_FRONTMATTER_KEY,
+    parse_agent_role_kit_ids,
+    render_agent_role_kits_section,
+)
+from gpd.core.model_visible_sections import render_model_visible_yaml_section
+from gpd.core.model_visible_text import (
+    AGENT_ARTIFACT_WRITE_AUTHORITIES,
+    AGENT_COMMIT_AUTHORITIES,
+    AGENT_ROLE_FAMILIES,
+    AGENT_SHARED_STATE_AUTHORITIES,
+    AGENT_SURFACES,
+    COMMAND_POLICY_FRONTMATTER_KEY,
+    COMMAND_POLICY_PROMPT_WRAPPER_KEY,
+    REVIEW_CONTRACT_FRONTMATTER_KEY,
+    REVIEW_CONTRACT_PROMPT_WRAPPER_KEY,
+    VALID_CONTEXT_MODES,
+    agent_visibility_note,
+    command_visibility_note,
+    skeptical_rigor_guardrails_section,
+)
+from gpd.core.registry_command_help import (
+    _COMMAND_HELP_KEYS as _REGISTRY_COMMAND_HELP_KEYS,
+)
+from gpd.core.registry_command_help import (
+    _COMMAND_HELP_VARIANT_KEYS as _REGISTRY_COMMAND_HELP_VARIANT_KEYS,
+)
+from gpd.core.registry_command_help import (
+    _parse_command_help_metadata,
+)
+from gpd.core.registry_frontmatter import (
+    _frontmatter_parts as _registry_frontmatter_parts,
+)
+from gpd.core.registry_frontmatter import (
+    _load_frontmatter_mapping as _registry_load_frontmatter_mapping,
+)
+from gpd.core.registry_frontmatter import (
+    _merge_tool_lists,
+    _parse_allowed_tools,
+    _parse_bool_field,
+    _parse_frontmatter_string_field,
+    _parse_requires,
+    _parse_tools,
+    _validate_raw_boolean_frontmatter_field,
+    _validate_raw_nonempty_string_frontmatter_field,
+)
+from gpd.core.registry_frontmatter import (
+    _parse_frontmatter as _registry_parse_frontmatter,
+)
+from gpd.core.registry_frontmatter import (
+    _raw_scalar_frontmatter_value as _registry_raw_scalar_frontmatter_value,
+)
+from gpd.core.registry_review_contract import _parse_review_contract, render_review_contract_section
+from gpd.core.registry_types import (
+    AgentDef,
+    CommandDef,
+    CommandHelpMetadata,
+    CommandHelpVariant,
+    CommandNameFormat,
+    CommandOutputPolicy,
+    CommandPolicy,
+    CommandSubjectPolicy,
+    CommandSupportingContextPolicy,
+    ReviewCommandContract,
+    ReviewContractConditionalRequirement,
+    ReviewContractScopeVariant,
+    SkillDef,
+)
+from gpd.core.strict_yaml import load_strict_yaml
+from gpd.core.workflow_staging import (
+    WorkflowStageManifest,
+    invalidate_workflow_stage_manifest_cache,
+    known_init_fields_for_workflow,
+    load_workflow_stage_manifest_from_path,
+    resolve_workflow_stage_manifest_path,
+)
+from gpd.specs import SPECS_DIR
+
+# ─── Package layout ──────────────────────────────────────────────────────────
+
+_PKG_ROOT = Path(__file__).resolve().parent  # gpd/
+AGENTS_DIR = _PKG_ROOT / "agents"
+COMMANDS_DIR = _PKG_ROOT / "commands"
+_MODEL_VISIBLE_INCLUDE_PATH_PREFIX = "{GPD_INSTALL_DIR}/__gpd_registry_include__/"
+LOCAL_CLI_BRIDGE_WORKFLOW_EXEMPT_COMMANDS: frozenset[str] = frozenset({"health", "suggest-next"})
+
+# ─── Frontmatter parsing helpers ────────────────────────────────────────────
+
+_MODEL_VISIBLE_INCLUDE_START_RE = re.compile(r"^[ \t]*<!-- \[included:.*?\] -->[ \t]*$")
+_MODEL_VISIBLE_INCLUDE_END_RE = re.compile(r"^[ \t]*<!-- \[end included\] -->[ \t]*$")
+_MODEL_VISIBLE_FENCE_RE = re.compile(r"^[ \t]*(?P<fence>`{3,}|~{3,})")
+_STANDALONE_HTML_COMMENT_RE = re.compile(r"^[ \t]*<!--(?P<body>.*?)-->[ \t]*$", re.DOTALL)
+_SPAWN_CONTRACT_BLOCK_RE = re.compile(
+    r"^[ \t]*<spawn_contract>[ \t]*$\n(?P<body>.*?)^[ \t]*</spawn_contract>[ \t]*$",
+    re.DOTALL | re.MULTILINE,
+)
+_INTERACTIVE_SPAWN_CONTRACT_BLOCK_RE = re.compile(
+    r"^[ \t]*<spawn_contract_interactive>[ \t]*$\n(?P<body>.*?)^[ \t]*</spawn_contract_interactive>[ \t]*$",
+    re.DOTALL | re.MULTILINE,
+)
+_UNQUOTED_PLACEHOLDER_PATH_LIST_ITEM_RE = re.compile(r"^[ \t]*-[ \t]+\{[^}\n]+\}/[^#\n]*(?:#.*)?$")
+_SPAWN_CONTRACT_WRITE_SCOPE_MODES = ("scoped_write", "direct")
+_INTERACTIVE_SPAWN_CONTRACT_WRITE_SCOPE_MODES = ("no_write",)
+_INTERACTIVE_SPAWN_CONTRACT_SHARED_STATE_POLICIES = ("none",)
+_COMMAND_FRONTMATTER_KEYS = frozenset(
+    {
+        "name",
+        "description",
+        "argument-hint",
+        # Runtime-projected prompt surfaces may still carry this presentation key.
+        "color",
+        "requires",
+        "allowed-tools",
+        REVIEW_CONTRACT_FRONTMATTER_KEY,
+        COMMAND_POLICY_FRONTMATTER_KEY,
+        "context_mode",
+        "project_reentry_capable",
+        # plan-phase carries this metadata in canonical frontmatter even though
+        # registry consumers currently do not project it.
+        "agent",
+        "help",
+    }
+)
+_AGENT_FRONTMATTER_KEYS = frozenset(
+    {
+        "name",
+        "description",
+        "tools",
+        "allowed-tools",
+        "commit_authority",
+        "surface",
+        "role_family",
+        "artifact_write_authority",
+        "shared_state_authority",
+        AGENT_ROLE_KITS_FRONTMATTER_KEY,
+        "color",
+    }
+)
+_COMMAND_POLICY_FIELD_ORDER = _registry_command_policy._COMMAND_POLICY_FIELD_ORDER
+_COMMAND_POLICY_SUBJECT_FIELD_ORDER = _registry_command_policy._COMMAND_POLICY_SUBJECT_FIELD_ORDER
+_COMMAND_POLICY_SUPPORTING_CONTEXT_FIELD_ORDER = _registry_command_policy._COMMAND_POLICY_SUPPORTING_CONTEXT_FIELD_ORDER
+_COMMAND_POLICY_OUTPUT_FIELD_ORDER = _registry_command_policy._COMMAND_POLICY_OUTPUT_FIELD_ORDER
+_COMMAND_POLICY_KEYS = _registry_command_policy._COMMAND_POLICY_KEYS
+_COMMAND_POLICY_SUBJECT_KEYS = _registry_command_policy._COMMAND_POLICY_SUBJECT_KEYS
+_COMMAND_POLICY_SUPPORTING_CONTEXT_KEYS = _registry_command_policy._COMMAND_POLICY_SUPPORTING_CONTEXT_KEYS
+_COMMAND_POLICY_OUTPUT_KEYS = _registry_command_policy._COMMAND_POLICY_OUTPUT_KEYS
+_COMMAND_HELP_KEYS = _REGISTRY_COMMAND_HELP_KEYS
+_COMMAND_HELP_VARIANT_KEYS = _REGISTRY_COMMAND_HELP_VARIANT_KEYS
+_WRITE_PAPER_EXTERNAL_AUTHORING_INPUT_KIND = "authoring_intake_manifest"
+_WRITE_PAPER_EXTERNAL_AUTHORING_SCOPE = "explicit_intake_manifest"
+_WRITE_PAPER_EXTERNAL_AUTHORING_REQUIRED_OUTPUTS = (
+    "${PAPER_DIR}/{topic_specific_stem}.tex",
+    "${PAPER_DIR}/PAPER-CONFIG.json",
+    "${PAPER_DIR}/ARTIFACT-MANIFEST.json",
+    "${PAPER_DIR}/BIBLIOGRAPHY-AUDIT.json",
+    "${PAPER_DIR}/reproducibility-manifest.json",
+)
+_WRITE_PAPER_EXTERNAL_AUTHORING_REQUIRED_EVIDENCE = (
+    "validated external authoring intake manifest with explicit claim-to-evidence bindings",
+)
+_WRITE_PAPER_EXTERNAL_AUTHORING_BLOCKING_CONDITIONS = ("invalid or incomplete external authoring intake manifest",)
+_WRITE_PAPER_EXTERNAL_AUTHORING_RELAXED_PREFLIGHT_CHECKS = (
+    "project_state",
+    "roadmap",
+    "conventions",
+    "research_artifacts",
+    "verification_reports",
+    "manuscript_proof_review",
+)
+_WRITE_PAPER_EXTERNAL_AUTHORING_OPTIONAL_PREFLIGHT_CHECKS = (
+    "artifact_manifest",
+    "bibliography_audit",
+    "bibliography_audit_clean",
+    "reproducibility_manifest",
+    "reproducibility_ready",
+)
+
+
+def _validate_command_frontmatter_keys(meta: dict[object, object], *, command_name: str) -> None:
+    """Reject unknown command frontmatter keys so all command surfaces stay aligned."""
+
+    unknown_keys = sorted(str(key) for key in meta if str(key) not in _COMMAND_FRONTMATTER_KEYS)
+    if unknown_keys:
+        raise ValueError(f"unknown frontmatter keys for {command_name}: {', '.join(unknown_keys)}")
+
+
+def _validate_agent_frontmatter_keys(meta: dict[object, object], *, agent_name: str) -> None:
+    """Reject unknown agent frontmatter keys so all agent surfaces stay aligned."""
+
+    unknown_keys = sorted(str(key) for key in meta if str(key) not in _AGENT_FRONTMATTER_KEYS)
+    if unknown_keys:
+        raise ValueError(f"unknown frontmatter keys for {agent_name}: {', '.join(unknown_keys)}")
+
+
+def _inline_model_visible_includes(content: str) -> str:
+    """Inline shared include directives while preserving canonical placeholder tokens."""
+
+    expanded = expand_at_includes(content, _PKG_ROOT, _MODEL_VISIBLE_INCLUDE_PATH_PREFIX)
+    cleaned_lines: list[str] = []
+    in_included_block = False
+    active_fence_char: str | None = None
+    active_fence_length = 0
+
+    for line in expanded.splitlines(keepends=True):
+        stripped = line.strip()
+        if _MODEL_VISIBLE_INCLUDE_START_RE.fullmatch(stripped):
+            in_included_block = True
+            continue
+        if _MODEL_VISIBLE_INCLUDE_END_RE.fullmatch(stripped):
+            in_included_block = False
+            continue
+
+        fence_match = _MODEL_VISIBLE_FENCE_RE.match(line)
+        if active_fence_char is None:
+            if fence_match is not None:
+                fence = fence_match.group("fence")
+                active_fence_char = fence[0]
+                active_fence_length = len(fence)
+                cleaned_lines.append(line)
+                continue
+        else:
+            if (
+                fence_match is not None
+                and fence_match.group("fence")[0] == active_fence_char
+                and len(fence_match.group("fence")) >= active_fence_length
+            ):
+                active_fence_char = None
+                active_fence_length = 0
+            cleaned_lines.append(line)
+            continue
+
+        comment_match = _STANDALONE_HTML_COMMENT_RE.fullmatch(stripped)
+        if comment_match is not None and not in_included_block:
+            body = comment_match.group("body").strip()
+            # Keep executable contract markers visible even in direct prompt text.
+            if body.startswith("ASSERT_CONVENTION:"):
+                cleaned_lines.append(line)
+            continue
+
+        cleaned_lines.append(line)
+
+    cleaned = "".join(cleaned_lines)
+    return (
+        cleaned.replace(
+            f"{_MODEL_VISIBLE_INCLUDE_PATH_PREFIX}get-physics-done/",
+            "{GPD_INSTALL_DIR}/",
+        )
+        .replace(
+            f"{_MODEL_VISIBLE_INCLUDE_PATH_PREFIX}get-physics-done",
+            "{GPD_INSTALL_DIR}",
+        )
+        .replace(
+            f"{_MODEL_VISIBLE_INCLUDE_PATH_PREFIX}agents/",
+            "{GPD_AGENTS_DIR}/",
+        )
+        .replace(
+            f"{_MODEL_VISIBLE_INCLUDE_PATH_PREFIX}agents",
+            "{GPD_AGENTS_DIR}",
+        )
+    )
+
+
+# ─── Parsing helpers ─────────────────────────────────────────────────────────
+
+
+def _frontmatter_parts(text: str) -> tuple[str | None, str]:
+    """Compatibility facade for registry frontmatter splitting."""
+
+    return _registry_frontmatter_parts(text)
+
+
+def _parse_frontmatter(text: str) -> tuple[dict[str, object], str]:
+    """Compatibility facade for registry frontmatter parsing."""
+
+    return _registry_parse_frontmatter(text, yaml_loader=load_strict_yaml)
+
+
+def _load_frontmatter_mapping(frontmatter: str, *, error_prefix: str) -> dict[str, object]:
+    """Compatibility facade for strict registry frontmatter loading."""
+
+    return _registry_load_frontmatter_mapping(
+        frontmatter,
+        error_prefix=error_prefix,
+        yaml_loader=load_strict_yaml,
+    )
+
+
+_raw_scalar_frontmatter_value = _registry_raw_scalar_frontmatter_value
+
+
+_command_policy_frontmatter_value = _registry_command_policy._command_policy_frontmatter_value
+_command_policy_is_publication_contract = _registry_command_policy._command_policy_is_publication_contract
+_command_policy_payload = _registry_command_policy._command_policy_payload
+_command_policy_requests_check = _registry_command_policy._command_policy_requests_check
+_command_policy_supported_roots_from_patterns = _registry_command_policy._command_policy_supported_roots_from_patterns
+_command_policy_supporting_context_from_frontmatter = (
+    _registry_command_policy._command_policy_supporting_context_from_frontmatter
+)
+_merge_command_policy_defaults = _registry_command_policy._merge_command_policy_defaults
+_merge_command_policy_submapping = _registry_command_policy._merge_command_policy_submapping
+_normalize_command_output_policy = _registry_command_policy._normalize_command_output_policy
+_normalize_command_policy_bool = _registry_command_policy._normalize_command_policy_bool
+_normalize_command_policy_context_mode = _registry_command_policy._normalize_command_policy_context_mode
+_normalize_command_policy_payload = _registry_command_policy._normalize_command_policy_payload
+_normalize_command_policy_string = _registry_command_policy._normalize_command_policy_string
+_normalize_command_policy_string_list = _registry_command_policy._normalize_command_policy_string_list
+_normalize_command_subject_policy = _registry_command_policy._normalize_command_subject_policy
+_normalize_command_supporting_context_policy = _registry_command_policy._normalize_command_supporting_context_policy
+_parse_command_policy = _registry_command_policy._parse_command_policy
+_publication_contract_mentions_external_artifact = _registry_command_policy._publication_contract_mentions_external_artifact
+_publication_subject_policy_defaults = _registry_command_policy._publication_subject_policy_defaults
+_render_command_policy_payload = _registry_command_policy._render_command_policy_payload
+_render_command_policy_submapping = _registry_command_policy._render_command_policy_submapping
+
+
+def _validate_raw_command_frontmatter(frontmatter: str | None, *, command_name: str) -> None:
+    """Reject loose raw frontmatter spellings for strict command metadata."""
+
+    _validate_raw_nonempty_string_frontmatter_field(
+        frontmatter,
+        field_name="context_mode",
+        owner_name=command_name,
+    )
+    _validate_raw_nonempty_string_frontmatter_field(
+        frontmatter,
+        field_name="agent",
+        owner_name=command_name,
+    )
+    _validate_raw_boolean_frontmatter_field(
+        frontmatter,
+        field_name="project_reentry_capable",
+        command_name=command_name,
+    )
+
+
+def _validate_raw_agent_frontmatter(frontmatter: str | None, *, agent_name: str) -> None:
+    """Reject explicit blank or null spellings for defaulted agent metadata."""
+
+    _validate_raw_nonempty_string_frontmatter_field(
+        frontmatter,
+        field_name="commit_authority",
+        owner_name=agent_name,
+    )
+    for field_name in (
+        "surface",
+        "role_family",
+        "artifact_write_authority",
+        "shared_state_authority",
+    ):
+        _validate_raw_nonempty_string_frontmatter_field(
+            frontmatter,
+            field_name=field_name,
+            owner_name=agent_name,
+        )
+
+
+@lru_cache(maxsize=1)
+def _canonical_agent_names(agents_dir: Path) -> frozenset[str]:
+    """Return validated built-in agent names from the canonical package tree."""
+
+    return frozenset(load_agents_from_dir(agents_dir))
+
+
+@lru_cache(maxsize=1)
+def _builtin_agent_names() -> frozenset[str]:
+    """Return built-in agent names from the packaged canonical agent tree."""
+
+    return frozenset(load_agents_from_dir(_PKG_ROOT / "agents"))
+
+
+def canonical_agent_names() -> tuple[str, ...]:
+    """Return the sorted built-in agent labels accepted by command frontmatter."""
+
+    return tuple(sorted(_canonical_agent_names(AGENTS_DIR)))
+
+
+def _parse_project_reentry_capable(raw: object, *, command_name: str, context_mode: str) -> bool:
+    """Normalize project re-entry metadata and reject invalid command-mode pairings."""
+    value = _parse_bool_field(
+        raw,
+        field_name="project_reentry_capable",
+        command_name=command_name,
+        default=False,
+    )
+    if value and context_mode != "project-required":
+        raise ValueError(f"project_reentry_capable for {command_name} requires context_mode 'project-required'")
+    return value
+
+
+def _parse_command_agent(raw: object, *, command_name: str) -> str | None:
+    """Normalize optional command agent metadata to a canonical skill name."""
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raise ValueError(f"agent for {command_name} must be a string")
+    value = raw.strip().lower()
+    if not value:
+        raise ValueError(f"agent for {command_name} must be a non-empty string")
+    normalized = canonical_skill_label(value)
+    known_agents = frozenset(canonical_agent_names()) | _builtin_agent_names()
+    if known_agents and normalized not in known_agents:
+        raise ValueError(f"Unknown agent {normalized!r} for {command_name}")
+    return normalized
+
+
+def _review_contract_frontmatter_value(meta: dict[str, object], *, command_name: str) -> object:
+    """Return the canonical review-contract frontmatter payload."""
+
+    if REVIEW_CONTRACT_PROMPT_WRAPPER_KEY in meta:
+        raise ValueError(
+            f"review-contract for {command_name} must use the canonical frontmatter key '{REVIEW_CONTRACT_FRONTMATTER_KEY}'"
+        )
+    if REVIEW_CONTRACT_FRONTMATTER_KEY not in meta:
+        return None
+    return {REVIEW_CONTRACT_FRONTMATTER_KEY: meta.get(REVIEW_CONTRACT_FRONTMATTER_KEY)}
+
+
+def _parse_context_mode(raw: object, *, command_name: str) -> str:
+    """Normalize command context_mode frontmatter to a validated string."""
+    if raw is None:
+        return "project-required"
+
+    if not isinstance(raw, str):
+        raise ValueError(f"context_mode for {command_name} must be a string")
+    mode = raw.strip().lower()
+    if not mode:
+        raise ValueError(f"context_mode for {command_name} must be a non-empty string")
+    if mode not in VALID_CONTEXT_MODES:
+        valid = ", ".join(VALID_CONTEXT_MODES)
+        raise ValueError(f"Invalid context_mode {mode!r} for {command_name}; expected one of: {valid}")
+    return mode
+
+
+def _parse_commit_authority(raw: object, *, agent_name: str) -> str:
+    """Normalize agent commit ownership to a validated string."""
+    if raw is None:
+        return "orchestrator"
+
+    if not isinstance(raw, str):
+        raise ValueError(f"commit_authority for {agent_name} must be a string")
+    authority = raw.strip().lower()
+    if not authority:
+        raise ValueError(f"commit_authority for {agent_name} must be a non-empty string")
+    if authority not in AGENT_COMMIT_AUTHORITIES:
+        valid = ", ".join(AGENT_COMMIT_AUTHORITIES)
+        raise ValueError(f"Invalid commit_authority {authority!r} for {agent_name}; expected one of: {valid}")
+    return authority
+
+
+def _parse_agent_metadata_enum(
+    raw: object,
+    *,
+    field_name: str,
+    agent_name: str,
+    valid_values: tuple[str, ...],
+    default: str,
+) -> str:
+    """Normalize additive agent metadata fields with explicit validation."""
+    if raw is None:
+        return default
+
+    if not isinstance(raw, str):
+        raise ValueError(f"{field_name} for {agent_name} must be a string")
+    value = raw.strip().lower()
+    if not value:
+        raise ValueError(f"{field_name} for {agent_name} must be a non-empty string")
+    if value not in valid_values:
+        valid = ", ".join(valid_values)
+        raise ValueError(f"Invalid {field_name} {value!r} for {agent_name}; expected one of: {valid}")
+    return value
+
+
+def _agent_requirements_payload(
+    *,
+    tools: list[str],
+    commit_authority: str,
+    surface: str,
+    role_family: str,
+    artifact_write_authority: str,
+    shared_state_authority: str,
+) -> dict[str, object]:
+    return {
+        "commit_authority": commit_authority,
+        "surface": surface,
+        "role_family": role_family,
+        "artifact_write_authority": artifact_write_authority,
+        "shared_state_authority": shared_state_authority,
+        "tools": list(tools),
+    }
+
+
+def _normalize_agent_requirements_inputs(
+    *,
+    tools: list[str],
+    commit_authority: str,
+    surface: str,
+    role_family: str,
+    artifact_write_authority: str,
+    shared_state_authority: str,
+) -> dict[str, object]:
+    """Validate and canonicalize public agent-requirements render inputs."""
+
+    owner_name = "rendered agent requirements"
+    return _agent_requirements_payload(
+        tools=_parse_tools(list(tools), owner_name=owner_name),
+        commit_authority=_parse_commit_authority(commit_authority, agent_name=owner_name),
+        surface=_parse_agent_metadata_enum(
+            surface,
+            field_name="surface",
+            agent_name=owner_name,
+            valid_values=AGENT_SURFACES,
+            default="internal",
+        ),
+        role_family=_parse_agent_metadata_enum(
+            role_family,
+            field_name="role_family",
+            agent_name=owner_name,
+            valid_values=AGENT_ROLE_FAMILIES,
+            default="analysis",
+        ),
+        artifact_write_authority=_parse_agent_metadata_enum(
+            artifact_write_authority,
+            field_name="artifact_write_authority",
+            agent_name=owner_name,
+            valid_values=AGENT_ARTIFACT_WRITE_AUTHORITIES,
+            default="scoped_write",
+        ),
+        shared_state_authority=_parse_agent_metadata_enum(
+            shared_state_authority,
+            field_name="shared_state_authority",
+            agent_name=owner_name,
+            valid_values=AGENT_SHARED_STATE_AUTHORITIES,
+            default="return_only",
+        ),
+    )
+
+
+def render_agent_requirements_section(
+    *,
+    tools: list[str],
+    commit_authority: str,
+    surface: str,
+    role_family: str,
+    artifact_write_authority: str,
+    shared_state_authority: str,
+) -> str:
+    """Render a model-visible agent-contract block for agent prompt bodies."""
+
+    normalized_payload = _normalize_agent_requirements_inputs(
+        tools=tools,
+        commit_authority=commit_authority,
+        surface=surface,
+        role_family=role_family,
+        artifact_write_authority=artifact_write_authority,
+        shared_state_authority=shared_state_authority,
+    )
+    return render_model_visible_yaml_section(
+        heading="Agent Requirements",
+        note=agent_visibility_note(),
+        payload=normalized_payload,
+    )
+
+
+def render_agent_visibility_sections_from_frontmatter(frontmatter: str, *, agent_name: str) -> str:
+    """Render canonical model-visible agent constraints from raw frontmatter."""
+
+    _validate_raw_agent_frontmatter(frontmatter, agent_name=agent_name)
+    meta = _load_frontmatter_mapping(frontmatter, error_prefix=f"Malformed frontmatter for {agent_name}")
+    tools = _merge_tool_lists(
+        _parse_tools(meta.get("tools"), owner_name=agent_name),
+        _parse_tools(meta.get("allowed-tools"), field_name="allowed-tools", owner_name=agent_name),
+    )
+    role_kits = parse_agent_role_kit_ids(meta.get(AGENT_ROLE_KITS_FRONTMATTER_KEY), agent_name=agent_name)
+    sections = [
+        render_agent_requirements_section(
+            tools=tools,
+            commit_authority=_parse_commit_authority(meta.get("commit_authority"), agent_name=agent_name),
+            surface=_parse_agent_metadata_enum(
+                meta.get("surface"),
+                field_name="surface",
+                agent_name=agent_name,
+                valid_values=AGENT_SURFACES,
+                default="internal",
+            ),
+            role_family=_parse_agent_metadata_enum(
+                meta.get("role_family"),
+                field_name="role_family",
+                agent_name=agent_name,
+                valid_values=AGENT_ROLE_FAMILIES,
+                default="analysis",
+            ),
+            artifact_write_authority=_parse_agent_metadata_enum(
+                meta.get("artifact_write_authority"),
+                field_name="artifact_write_authority",
+                agent_name=agent_name,
+                valid_values=AGENT_ARTIFACT_WRITE_AUTHORITIES,
+                default="scoped_write",
+            ),
+            shared_state_authority=_parse_agent_metadata_enum(
+                meta.get("shared_state_authority"),
+                field_name="shared_state_authority",
+                agent_name=agent_name,
+                valid_values=AGENT_SHARED_STATE_AUTHORITIES,
+                default="return_only",
+            ),
+        )
+    ]
+    role_kit_section = render_agent_role_kits_section(role_kits)
+    if role_kit_section:
+        sections.append(role_kit_section)
+    return "\n\n".join(sections)
+
+
+def _command_visibility_payload(
+    *,
+    context_mode: str,
+    project_reentry_capable: bool,
+    agent: str | None = None,
+    allowed_tools: list[str],
+    requires: dict[str, object],
+    command_policy: CommandPolicy | dict[str, object] | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "context_mode": context_mode,
+        "project_reentry_capable": project_reentry_capable,
+    }
+    if agent is not None:
+        payload["agent"] = agent
+    if allowed_tools:
+        payload["allowed_tools"] = list(allowed_tools)
+    if requires:
+        payload["requires"] = requires
+    rendered_command_policy = _render_command_policy_payload(command_policy)
+    if rendered_command_policy:
+        payload[COMMAND_POLICY_PROMPT_WRAPPER_KEY] = rendered_command_policy
+    return payload
+
+
+def _normalize_command_visibility_inputs(
+    *,
+    context_mode: str,
+    project_reentry_capable: bool,
+    agent: str | None = None,
+    allowed_tools: list[str],
+    requires: dict[str, object],
+    command_policy: CommandPolicy | Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Validate and canonicalize public command-requirements render inputs."""
+
+    command_name = "rendered command requirements"
+    normalized_context_mode = _parse_context_mode(context_mode, command_name=command_name)
+    normalized_requires = _parse_requires(requires, command_name=command_name)
+    normalized_project_reentry_capable = _parse_project_reentry_capable(
+        project_reentry_capable,
+        command_name=command_name,
+        context_mode=normalized_context_mode,
+    )
+    return _command_visibility_payload(
+        context_mode=normalized_context_mode,
+        project_reentry_capable=normalized_project_reentry_capable,
+        agent=_parse_command_agent(agent, command_name=command_name),
+        allowed_tools=_parse_allowed_tools(allowed_tools, command_name=command_name),
+        requires=normalized_requires,
+        command_policy=_parse_command_policy(
+            command_policy,
+            command_name=command_name,
+            context_mode=normalized_context_mode,
+            project_reentry_capable=normalized_project_reentry_capable,
+            requires=normalized_requires,
+        ),
+    )
+
+
+def render_command_requires_section(
+    *,
+    context_mode: str,
+    project_reentry_capable: bool,
+    agent: str | None = None,
+    allowed_tools: list[str],
+    requires: dict[str, object],
+    command_policy: CommandPolicy | Mapping[str, object] | None = None,
+) -> str:
+    """Render model-visible execution constraints from command frontmatter."""
+
+    normalized_payload = _normalize_command_visibility_inputs(
+        context_mode=context_mode,
+        project_reentry_capable=project_reentry_capable,
+        agent=agent,
+        allowed_tools=allowed_tools,
+        requires=requires,
+        command_policy=command_policy,
+    )
+    return render_model_visible_yaml_section(
+        heading="Command Requirements",
+        note=command_visibility_note(),
+        payload=normalized_payload,
+    )
+
+
+def render_command_visibility_sections(
+    *,
+    context_mode: str,
+    project_reentry_capable: bool,
+    agent: str | None = None,
+    allowed_tools: list[str],
+    requires: dict[str, object],
+    command_policy: CommandPolicy | Mapping[str, object] | None = None,
+    review_contract: ReviewCommandContract | None,
+) -> str:
+    """Render model-visible command constraints in canonical prompt order."""
+
+    sections: list[str] = []
+    sections.append(
+        render_command_requires_section(
+            context_mode=context_mode,
+            project_reentry_capable=project_reentry_capable,
+            agent=agent,
+            allowed_tools=allowed_tools,
+            requires=requires,
+            command_policy=command_policy,
+        )
+    )
+
+    review_section = render_review_contract_section(review_contract)
+    if review_section:
+        sections.append(review_section)
+
+    return "\n\n".join(sections)
+
+
+def render_command_visibility_sections_from_frontmatter(frontmatter: str, *, command_name: str) -> str:
+    """Render canonical model-visible command constraints from raw frontmatter."""
+
+    _validate_raw_command_frontmatter(frontmatter, command_name=command_name)
+    meta = _load_frontmatter_mapping(frontmatter, error_prefix=f"Malformed frontmatter for {command_name}")
+    review_contract_value = _review_contract_frontmatter_value(meta, command_name=command_name)
+    command_policy_value, command_policy_explicit = _command_policy_frontmatter_value(meta, command_name=command_name)
+    _validate_command_frontmatter_keys(meta, command_name=command_name)
+    _parse_command_help_metadata(meta, command_name=command_name)
+
+    requires = _parse_requires(meta.get("requires"), command_name=command_name)
+    allowed_tools = _parse_allowed_tools(meta.get("allowed-tools"), command_name=command_name)
+    agent = _parse_command_agent(meta.get("agent"), command_name=command_name)
+    context_mode = _parse_context_mode(meta.get("context_mode"), command_name=command_name)
+    project_reentry_capable = _parse_project_reentry_capable(
+        meta.get("project_reentry_capable"),
+        command_name=command_name,
+        context_mode=context_mode,
+    )
+    review_contract = _parse_review_contract(
+        review_contract_value,
+        command_name=command_name,
+    )
+    command_policy = _parse_command_policy(
+        command_policy_value,
+        command_name=command_name,
+        context_mode=context_mode,
+        project_reentry_capable=project_reentry_capable,
+        requires=requires,
+        review_contract=review_contract,
+        explicit=command_policy_explicit,
+    )
+    return render_command_visibility_sections(
+        context_mode=context_mode,
+        project_reentry_capable=project_reentry_capable,
+        agent=agent,
+        allowed_tools=allowed_tools,
+        requires=requires,
+        command_policy=command_policy,
+        review_contract=review_contract,
+    )
+
+
+def _agent_model_content(
+    body: str,
+    *,
+    tools: list[str],
+    commit_authority: str,
+    surface: str,
+    role_family: str,
+    artifact_write_authority: str,
+    shared_state_authority: str,
+    role_kits: tuple[str, ...] = (),
+) -> str:
+    """Return the model-visible agent body, including enforced agent constraints."""
+
+    body = _inline_model_visible_includes(body)
+    sections: list[str] = [
+        render_agent_requirements_section(
+            tools=tools,
+            commit_authority=commit_authority,
+            surface=surface,
+            role_family=role_family,
+            artifact_write_authority=artifact_write_authority,
+            shared_state_authority=shared_state_authority,
+        ),
+    ]
+    role_kit_section = render_agent_role_kits_section(role_kits)
+    if role_kit_section:
+        sections.append(role_kit_section)
+    sections.append(skeptical_rigor_guardrails_section())
+    if body:
+        sections.append(body)
+    return "\n\n".join(sections)
+
+
+def _command_model_content(
+    body: str,
+    review_contract: ReviewCommandContract | None,
+    *,
+    context_mode: str,
+    project_reentry_capable: bool,
+    agent: str | None = None,
+    allowed_tools: list[str],
+    requires: dict[str, object],
+    command_policy: CommandPolicy | None = None,
+) -> str:
+    """Return the model-visible command body, including enforced command constraints."""
+
+    body = _inline_model_visible_includes(body)
+    sections: list[str] = []
+    visibility_sections = render_command_visibility_sections(
+        context_mode=context_mode,
+        project_reentry_capable=project_reentry_capable,
+        agent=agent,
+        allowed_tools=allowed_tools,
+        requires=requires,
+        command_policy=command_policy,
+        review_contract=review_contract,
+    )
+    if visibility_sections:
+        sections.append(visibility_sections)
+    sections.append(skeptical_rigor_guardrails_section())
+    if body:
+        sections.append(body)
+    return "\n\n".join(sections)
+
+
+def _validate_write_paper_external_authoring_frontmatter(
+    path: Path,
+    *,
+    command_name: str,
+    context_mode: str,
+    command_policy: CommandPolicy | None,
+    review_contract: ReviewCommandContract | None,
+) -> None:
+    """Validate the bounded write-paper external-authoring lane owned by frontmatter."""
+
+    canonical_path = (COMMANDS_DIR / "write-paper.md").resolve(strict=False)
+    if command_name != "gpd:write-paper" or path.resolve(strict=False) != canonical_path:
+        return
+
+    errors: list[str] = []
+    if context_mode != "project-aware":
+        errors.append("context_mode must be project-aware")
+    if command_policy is None or command_policy.subject_policy is None:
+        errors.append("command-policy.subject_policy is required")
+    else:
+        subject_policy = command_policy.subject_policy
+        if subject_policy.explicit_input_kinds != [_WRITE_PAPER_EXTERNAL_AUTHORING_INPUT_KIND]:
+            errors.append(
+                "command-policy.subject_policy.explicit_input_kinds must contain only authoring_intake_manifest"
+            )
+        if subject_policy.allow_external_subjects is not False:
+            errors.append("command-policy.subject_policy.allow_external_subjects must be false")
+        if subject_policy.allow_interactive_without_subject is not False:
+            errors.append("command-policy.subject_policy.allow_interactive_without_subject must be false")
+        if subject_policy.bootstrap_allowed is not True:
+            errors.append("command-policy.subject_policy.bootstrap_allowed must be true")
+    if command_policy is None or command_policy.supporting_context_policy is None:
+        errors.append("command-policy.supporting_context_policy is required")
+    else:
+        supporting_context_policy = command_policy.supporting_context_policy
+        if supporting_context_policy.project_context_mode != "project-aware":
+            errors.append("command-policy.supporting_context_policy.project_context_mode must be project-aware")
+        if supporting_context_policy.project_reentry_mode != "disallowed":
+            errors.append("command-policy.supporting_context_policy.project_reentry_mode must be disallowed")
+
+    scope_variant = None
+    if review_contract is None:
+        errors.append("review-contract is required")
+    else:
+        matching_scope_variants = [
+            variant
+            for variant in review_contract.scope_variants
+            if str(variant.scope).strip() == _WRITE_PAPER_EXTERNAL_AUTHORING_SCOPE
+        ]
+        if len(matching_scope_variants) != 1:
+            errors.append("review-contract.scope_variants must include exactly one explicit_intake_manifest variant")
+        else:
+            scope_variant = matching_scope_variants[0]
+
+    if scope_variant is not None:
+        expected_variant_fields = {
+            "relaxed_preflight_checks": list(_WRITE_PAPER_EXTERNAL_AUTHORING_RELAXED_PREFLIGHT_CHECKS),
+            "optional_preflight_checks": list(_WRITE_PAPER_EXTERNAL_AUTHORING_OPTIONAL_PREFLIGHT_CHECKS),
+            "required_outputs_override": list(_WRITE_PAPER_EXTERNAL_AUTHORING_REQUIRED_OUTPUTS),
+            "required_evidence_override": list(_WRITE_PAPER_EXTERNAL_AUTHORING_REQUIRED_EVIDENCE),
+            "blocking_conditions_override": list(_WRITE_PAPER_EXTERNAL_AUTHORING_BLOCKING_CONDITIONS),
+        }
+        for field_name, expected_value in expected_variant_fields.items():
+            actual_value = list(getattr(scope_variant, field_name))
+            if len(actual_value) != len(set(actual_value)):
+                errors.append(f"review-contract.scope_variants[].{field_name} must not contain duplicates")
+            elif set(actual_value) != set(expected_value):
+                errors.append(f"review-contract.scope_variants[].{field_name} is out of sync")
+
+    if errors:
+        raise ValueError("gpd:write-paper external-authoring frontmatter is invalid: " + "; ".join(errors))
+
+
+def _parse_spawn_contracts(content: str, *, owner_name: str) -> tuple[dict[str, object], ...]:
+    """Parse canonical spawn-contract blocks from rendered markdown content."""
+
+    contracts: list[dict[str, object]] = []
+    seen_contracts: set[tuple[object, ...]] = set()
+    for match in _SPAWN_CONTRACT_BLOCK_RE.finditer(content):
+        block = textwrap.dedent(match.group("body")).strip()
+        if not block:
+            raise ValueError(f"spawn-contract for {owner_name}: empty block")
+        parsed = _parse_spawn_contract_block(block, owner_name=owner_name)
+        contract_key = _spawn_contract_key(parsed)
+        if contract_key in seen_contracts:
+            continue
+        seen_contracts.add(contract_key)
+        contracts.append(parsed)
+    return tuple(contracts)
+
+
+def _parse_interactive_spawn_contracts(content: str, *, owner_name: str) -> tuple[dict[str, object], ...]:
+    """Parse supervised no-write checkpoint contracts from rendered markdown content."""
+
+    contracts: list[dict[str, object]] = []
+    seen_contracts: set[tuple[object, ...]] = set()
+    for match in _INTERACTIVE_SPAWN_CONTRACT_BLOCK_RE.finditer(content):
+        block = textwrap.dedent(match.group("body")).strip()
+        if not block:
+            raise ValueError(f"interactive spawn-contract for {owner_name}: empty block")
+        parsed = _parse_interactive_spawn_contract_block(block, owner_name=owner_name)
+        contract_key = _spawn_contract_key(parsed)
+        if contract_key in seen_contracts:
+            continue
+        seen_contracts.add(contract_key)
+        contracts.append(parsed)
+    return tuple(contracts)
+
+
+def _command_workflow_metadata_content(command_name: str) -> str:
+    """Return same-stem workflow content used for command metadata discovery only."""
+
+    workflow_slug = command_slug_from_label(command_name)
+    workflow_path = _PKG_ROOT / "specs" / "workflows" / f"{workflow_slug}.md"
+    if not workflow_path.is_file():
+        return ""
+    parts = [_inline_model_visible_includes(workflow_path.read_text(encoding="utf-8"))]
+    parts.extend(_command_staged_workflow_metadata_parts(workflow_slug))
+    return "\n\n".join(part for part in parts if part)
+
+
+def _command_staged_workflow_metadata_parts(workflow_slug: str) -> tuple[str, ...]:
+    """Return staged workflow authority bodies for metadata-only discovery."""
+
+    manifest_path = _PKG_ROOT / "specs" / "workflows" / f"{workflow_slug}-stage-manifest.json"
+    if not manifest_path.is_file():
+        return ()
+
+    try:
+        manifest = load_workflow_stage_manifest_from_path(manifest_path, expected_workflow_id=workflow_slug)
+    except ValueError:
+        return ()
+
+    seen: set[Path] = set()
+    parts: list[str] = []
+    for stage in manifest.stages:
+        for authority in (*stage.mode_paths, *stage.loaded_authorities):
+            if not authority.startswith(f"workflows/{workflow_slug}/") or not authority.endswith(".md"):
+                continue
+            authority_path = _PKG_ROOT / "specs" / authority
+            if authority_path in seen or not authority_path.is_file():
+                continue
+            seen.add(authority_path)
+            parts.append(_inline_model_visible_includes(authority_path.read_text(encoding="utf-8")))
+    return tuple(parts)
+
+
+def _spawn_contract_key(value: object) -> tuple[object, ...]:
+    """Return a hashable, order-preserving key for parsed spawn-contract metadata."""
+
+    if isinstance(value, dict):
+        return tuple((key, _spawn_contract_key(item)) for key, item in value.items())
+    if isinstance(value, list):
+        return tuple(_spawn_contract_key(item) for item in value)
+    return (value,)
+
+
+def _validate_spawn_contract_list(
+    values: object,
+    *,
+    field_name: str,
+    owner_name: str,
+    allow_empty: bool = False,
+    contract_label: str = "spawn-contract",
+) -> list[str]:
+    """Validate a spawn-contract string list and reject empty or duplicate entries."""
+
+    if not isinstance(values, list):
+        raise ValueError(f"{contract_label} for {owner_name}: {field_name} must be a list")
+    if not values and not allow_empty:
+        raise ValueError(f"{contract_label} for {owner_name}: {field_name} must not be empty")
+
+    normalized: list[str] = []
+    first_indices: dict[str, int] = {}
+    for index, value in enumerate(values):
+        if not isinstance(value, str):
+            raise ValueError(f"{contract_label} for {owner_name}: {field_name}[{index}] must be a string")
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError(f"{contract_label} for {owner_name}: {field_name}[{index}] must be a non-empty string")
+        if stripped in first_indices:
+            first_index = first_indices[stripped]
+            raise ValueError(
+                f"{contract_label} for {owner_name}: {field_name}[{index}] "
+                f"duplicates {field_name}[{first_index}]: {stripped}"
+            )
+        first_indices[stripped] = index
+        normalized.append(stripped)
+    return normalized
+
+
+def _validate_spawn_contract(contract: dict[str, object], *, owner_name: str) -> dict[str, object]:
+    """Validate and normalize one parsed spawn-contract block."""
+
+    allowed_keys = {"activation", "write_scope", "expected_artifacts", "shared_state_policy"}
+    unknown_keys = sorted(str(key) for key in contract if str(key) not in allowed_keys)
+    if unknown_keys:
+        raise ValueError(f"spawn-contract for {owner_name}: unexpected fields: {', '.join(unknown_keys)}")
+
+    if "write_scope" not in contract:
+        raise ValueError(f"spawn-contract for {owner_name}: missing write_scope")
+    if "expected_artifacts" not in contract:
+        raise ValueError(f"spawn-contract for {owner_name}: missing expected_artifacts")
+    if "shared_state_policy" not in contract:
+        raise ValueError(f"spawn-contract for {owner_name}: missing shared_state_policy")
+
+    raw_write_scope = contract["write_scope"]
+    if not isinstance(raw_write_scope, dict):
+        raise ValueError(f"spawn-contract for {owner_name}: write_scope must be a mapping")
+    write_scope = dict(raw_write_scope)
+    unknown_write_scope_keys = sorted(str(key) for key in write_scope if str(key) not in {"mode", "allowed_paths"})
+    if unknown_write_scope_keys:
+        raise ValueError(
+            f"spawn-contract for {owner_name}: unexpected write_scope fields: {', '.join(unknown_write_scope_keys)}"
+        )
+    mode = write_scope.get("mode")
+    if not isinstance(mode, str) or not mode.strip():
+        raise ValueError(f"spawn-contract for {owner_name}: write_scope.mode must be a non-empty string")
+    mode = mode.strip()
+    if mode not in _SPAWN_CONTRACT_WRITE_SCOPE_MODES:
+        valid = ", ".join(_SPAWN_CONTRACT_WRITE_SCOPE_MODES)
+        raise ValueError(
+            f"spawn-contract for {owner_name}: invalid write_scope.mode {mode!r}; expected one of: {valid}"
+        )
+    write_scope["mode"] = mode
+    if "allowed_paths" not in write_scope:
+        raise ValueError(f"spawn-contract for {owner_name}: missing write_scope.allowed_paths")
+    write_scope["allowed_paths"] = _validate_spawn_contract_list(
+        write_scope["allowed_paths"],
+        field_name="write_scope.allowed_paths",
+        owner_name=owner_name,
+    )
+
+    expected_artifacts = _validate_spawn_contract_list(
+        contract["expected_artifacts"],
+        field_name="expected_artifacts",
+        owner_name=owner_name,
+    )
+
+    shared_state_policy = contract["shared_state_policy"]
+    if not isinstance(shared_state_policy, str) or not shared_state_policy.strip():
+        raise ValueError(f"spawn-contract for {owner_name}: shared_state_policy must be a non-empty string")
+    shared_state_policy = shared_state_policy.strip()
+    if shared_state_policy not in AGENT_SHARED_STATE_AUTHORITIES:
+        valid = ", ".join(AGENT_SHARED_STATE_AUTHORITIES)
+        raise ValueError(
+            f"spawn-contract for {owner_name}: invalid shared_state_policy {shared_state_policy!r}; "
+            f"expected one of: {valid}"
+        )
+
+    normalized: dict[str, object] = {
+        "write_scope": write_scope,
+        "expected_artifacts": expected_artifacts,
+        "shared_state_policy": shared_state_policy,
+    }
+    if "activation" in contract:
+        activation = contract["activation"]
+        if not isinstance(activation, str) or not activation.strip():
+            raise ValueError(f"spawn-contract for {owner_name}: activation must be a non-empty string")
+        normalized["activation"] = activation.strip()
+    return normalized
+
+
+def _validate_interactive_spawn_contract(contract: dict[str, object], *, owner_name: str) -> dict[str, object]:
+    """Validate the supervised interactive no-write checkpoint contract family."""
+
+    allowed_keys = {"activation", "write_scope", "expected_artifacts", "expected_return", "shared_state_policy"}
+    unknown_keys = sorted(str(key) for key in contract if str(key) not in allowed_keys)
+    if unknown_keys:
+        raise ValueError(f"interactive spawn-contract for {owner_name}: unexpected fields: {', '.join(unknown_keys)}")
+
+    missing_keys = sorted(key for key in allowed_keys if key not in contract)
+    if missing_keys:
+        raise ValueError(f"interactive spawn-contract for {owner_name}: missing fields: {', '.join(missing_keys)}")
+
+    activation = contract["activation"]
+    if not isinstance(activation, str) or not activation.strip():
+        raise ValueError(f"interactive spawn-contract for {owner_name}: activation must be a non-empty string")
+    activation = activation.strip()
+
+    raw_write_scope = contract["write_scope"]
+    if not isinstance(raw_write_scope, dict):
+        raise ValueError(f"interactive spawn-contract for {owner_name}: write_scope must be a mapping")
+    write_scope = dict(raw_write_scope)
+    unknown_write_scope_keys = sorted(str(key) for key in write_scope if str(key) not in {"mode", "allowed_paths"})
+    if unknown_write_scope_keys:
+        raise ValueError(
+            f"interactive spawn-contract for {owner_name}: unexpected write_scope fields: "
+            f"{', '.join(unknown_write_scope_keys)}"
+        )
+    mode = write_scope.get("mode")
+    if not isinstance(mode, str) or not mode.strip():
+        raise ValueError(f"interactive spawn-contract for {owner_name}: write_scope.mode must be a non-empty string")
+    mode = mode.strip()
+    if mode not in _INTERACTIVE_SPAWN_CONTRACT_WRITE_SCOPE_MODES:
+        valid = ", ".join(_INTERACTIVE_SPAWN_CONTRACT_WRITE_SCOPE_MODES)
+        raise ValueError(
+            f"interactive spawn-contract for {owner_name}: invalid write_scope.mode {mode!r}; expected one of: {valid}"
+        )
+    write_scope["mode"] = mode
+    if "allowed_paths" not in write_scope:
+        raise ValueError(f"interactive spawn-contract for {owner_name}: missing write_scope.allowed_paths")
+    write_scope["allowed_paths"] = _validate_spawn_contract_list(
+        write_scope["allowed_paths"],
+        field_name="write_scope.allowed_paths",
+        owner_name=owner_name,
+        allow_empty=True,
+        contract_label="interactive spawn-contract",
+    )
+    if write_scope["allowed_paths"]:
+        raise ValueError(
+            f"interactive spawn-contract for {owner_name}: write_scope.allowed_paths must be empty for no_write"
+        )
+
+    expected_artifacts = _validate_spawn_contract_list(
+        contract["expected_artifacts"],
+        field_name="expected_artifacts",
+        owner_name=owner_name,
+        allow_empty=True,
+        contract_label="interactive spawn-contract",
+    )
+    if expected_artifacts:
+        raise ValueError(f"interactive spawn-contract for {owner_name}: expected_artifacts must be empty for no_write")
+
+    expected_return = contract["expected_return"]
+    if not isinstance(expected_return, dict):
+        raise ValueError(f"interactive spawn-contract for {owner_name}: expected_return must be a mapping")
+    expected_return = dict(expected_return)
+    expected_return_keys = [str(key) for key in expected_return]
+    if sorted(expected_return_keys) != ["status"]:
+        raise ValueError(f"interactive spawn-contract for {owner_name}: expected_return must contain only status")
+    status = next(value for key, value in expected_return.items() if str(key) == "status")
+    if not isinstance(status, str) or status.strip() != "checkpoint":
+        raise ValueError(f"interactive spawn-contract for {owner_name}: expected_return.status must be checkpoint")
+    expected_return = {"status": status.strip()}
+
+    shared_state_policy = contract["shared_state_policy"]
+    if not isinstance(shared_state_policy, str) or not shared_state_policy.strip():
+        raise ValueError(f"interactive spawn-contract for {owner_name}: shared_state_policy must be a non-empty string")
+    shared_state_policy = shared_state_policy.strip()
+    if shared_state_policy not in _INTERACTIVE_SPAWN_CONTRACT_SHARED_STATE_POLICIES:
+        valid = ", ".join(_INTERACTIVE_SPAWN_CONTRACT_SHARED_STATE_POLICIES)
+        raise ValueError(
+            f"interactive spawn-contract for {owner_name}: invalid shared_state_policy {shared_state_policy!r}; "
+            f"expected one of: {valid}"
+        )
+
+    return {
+        "activation": activation,
+        "write_scope": write_scope,
+        "expected_artifacts": expected_artifacts,
+        "expected_return": expected_return,
+        "shared_state_policy": shared_state_policy,
+    }
+
+
+def _parse_interactive_spawn_contract_block(block: str, *, owner_name: str) -> dict[str, object]:
+    """Parse one supervised interactive spawn-contract YAML block."""
+
+    parsed = _load_spawn_contract_mapping(
+        block,
+        owner_name=owner_name,
+        contract_label="interactive spawn-contract",
+    )
+    return _validate_interactive_spawn_contract(parsed, owner_name=owner_name)
+
+
+def _parse_spawn_contract_block(block: str, *, owner_name: str) -> dict[str, object]:
+    """Parse one spawn-contract block as strict YAML."""
+
+    parsed = _load_spawn_contract_mapping(
+        block,
+        owner_name=owner_name,
+        contract_label="spawn-contract",
+    )
+    return _validate_spawn_contract(parsed, owner_name=owner_name)
+
+
+def _load_spawn_contract_mapping(
+    block: str,
+    *,
+    owner_name: str,
+    contract_label: str,
+) -> dict[str, object]:
+    """Parse one spawn-contract YAML mapping."""
+
+    _reject_unquoted_placeholder_path_list_items(block, owner_name=owner_name, contract_label=contract_label)
+    try:
+        parsed = load_strict_yaml(block)
+    except yaml.YAMLError as exc:
+        raise ValueError(f"{contract_label} for {owner_name}: malformed YAML: {exc}") from exc
+
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{contract_label} for {owner_name}: block must parse to a mapping")
+    return dict(parsed)
+
+
+def _reject_unquoted_placeholder_path_list_items(block: str, *, owner_name: str, contract_label: str) -> None:
+    """Reject YAML list items such as ``- {phase_dir}/file.md`` before parsing."""
+
+    for line_number, line in enumerate(block.splitlines(), start=1):
+        if _UNQUOTED_PLACEHOLDER_PATH_LIST_ITEM_RE.match(line):
+            raise ValueError(
+                f"{contract_label} for {owner_name}: unquoted placeholder path list item at line {line_number}; "
+                'quote placeholder paths such as "{phase_dir}/file.md"'
+            )
+
+
+def _load_command_staged_loading(path: Path, *, allowed_tools: list[str]) -> WorkflowStageManifest | None:
+    """Load staged-loading metadata for a command from its workflow sidecar."""
+
+    manifest_path = resolve_workflow_stage_manifest_path(path.stem)
+    if not manifest_path.is_file():
+        return None
+    canonical_manifest_path = (SPECS_DIR / "workflows" / f"{path.stem}-stage-manifest.json").resolve(strict=False)
+    canonical_command_path = (_PKG_ROOT / "commands" / path.name).resolve(strict=False)
+    if (
+        path.resolve(strict=False) != canonical_command_path
+        and manifest_path.resolve(strict=False) == canonical_manifest_path
+    ):
+        return None
+    return load_workflow_stage_manifest_from_path(
+        manifest_path,
+        expected_workflow_id=path.stem,
+        allowed_tools=allowed_tools,
+        known_init_fields=known_init_fields_for_workflow(path.stem),
+    )
+
+
+def _parse_agent_file(path: Path, source: str) -> AgentDef:
+    """Parse a single agent .md file into an AgentDef."""
+    text = path.read_text(encoding="utf-8")
+    raw_frontmatter, _unused_body = _frontmatter_parts(text)
+    try:
+        meta, body = _parse_frontmatter(text)
+    except ValueError as exc:
+        raise ValueError(f"Invalid frontmatter in {path}: {exc}") from exc
+    _validate_raw_agent_frontmatter(raw_frontmatter, agent_name=path.stem)
+    agent_name = _parse_frontmatter_string_field(
+        meta.get("name"),
+        field_name="name",
+        owner_name=path.stem,
+        required=True,
+    )
+    _validate_agent_frontmatter_keys(meta, agent_name=agent_name)
+    tools = _merge_tool_lists(
+        _parse_tools(meta.get("tools"), owner_name=agent_name),
+        _parse_tools(meta.get("allowed-tools"), field_name="allowed-tools", owner_name=agent_name),
+    )
+    description = _parse_frontmatter_string_field(
+        meta.get("description"),
+        field_name="description",
+        owner_name=agent_name,
+    )
+    commit_authority = _parse_commit_authority(meta.get("commit_authority"), agent_name=agent_name)
+    surface = _parse_agent_metadata_enum(
+        meta.get("surface"),
+        field_name="surface",
+        agent_name=agent_name,
+        valid_values=AGENT_SURFACES,
+        default="internal",
+    )
+    role_family = _parse_agent_metadata_enum(
+        meta.get("role_family"),
+        field_name="role_family",
+        agent_name=agent_name,
+        valid_values=AGENT_ROLE_FAMILIES,
+        default="analysis",
+    )
+    artifact_write_authority = _parse_agent_metadata_enum(
+        meta.get("artifact_write_authority"),
+        field_name="artifact_write_authority",
+        agent_name=agent_name,
+        valid_values=AGENT_ARTIFACT_WRITE_AUTHORITIES,
+        default="scoped_write",
+    )
+    shared_state_authority = _parse_agent_metadata_enum(
+        meta.get("shared_state_authority"),
+        field_name="shared_state_authority",
+        agent_name=agent_name,
+        valid_values=AGENT_SHARED_STATE_AUTHORITIES,
+        default="return_only",
+    )
+    role_kits = parse_agent_role_kit_ids(meta.get(AGENT_ROLE_KITS_FRONTMATTER_KEY), agent_name=agent_name)
+    color = _parse_frontmatter_string_field(
+        meta.get("color"),
+        field_name="color",
+        owner_name=agent_name,
+    )
+    system_prompt = _agent_model_content(
+        body.strip(),
+        tools=tools,
+        commit_authority=commit_authority,
+        surface=surface,
+        role_family=role_family,
+        artifact_write_authority=artifact_write_authority,
+        shared_state_authority=shared_state_authority,
+        role_kits=role_kits,
+    )
+    return AgentDef(
+        name=agent_name,
+        description=description,
+        system_prompt=system_prompt,
+        tools=tools,
+        commit_authority=commit_authority,
+        surface=surface,
+        role_family=role_family,
+        artifact_write_authority=artifact_write_authority,
+        shared_state_authority=shared_state_authority,
+        role_kits=role_kits,
+        color=color,
+        path=str(path),
+        source=source,
+    )
+
+
+def _parse_command_file(path: Path, source: str) -> CommandDef:
+    """Parse a single command .md file into a CommandDef."""
+    text = path.read_text(encoding="utf-8")
+    raw_frontmatter, _unused_body = _frontmatter_parts(text)
+    try:
+        meta, body = _parse_frontmatter(text)
+    except ValueError as exc:
+        raise ValueError(f"Invalid frontmatter in {path}: {exc}") from exc
+
+    command_name = _parse_frontmatter_string_field(
+        meta.get("name"),
+        field_name="name",
+        owner_name=path.stem,
+        default=path.stem,
+        required=True,
+    )
+    _validate_raw_command_frontmatter(raw_frontmatter, command_name=command_name)
+    try:
+        command_policy_value, command_policy_explicit = _command_policy_frontmatter_value(
+            meta,
+            command_name=command_name,
+        )
+    except ValueError as exc:
+        raise ValueError(f"Invalid command-policy in {path}: {exc}") from exc
+
+    try:
+        review_contract = _parse_review_contract(
+            _review_contract_frontmatter_value(meta, command_name=command_name),
+            command_name,
+        )
+    except ValueError as exc:
+        raise ValueError(f"Invalid review-contract in {path}: {exc}") from exc
+    _validate_command_frontmatter_keys(meta, command_name=command_name)
+    try:
+        help_metadata = _parse_command_help_metadata(meta, command_name=command_name)
+    except ValueError as exc:
+        raise ValueError(f"Invalid help metadata in {path}: {exc}") from exc
+    requires = _parse_requires(meta.get("requires"), command_name=command_name)
+    allowed_tools = _parse_allowed_tools(meta.get("allowed-tools"), command_name=command_name)
+    agent = _parse_command_agent(meta.get("agent"), command_name=command_name)
+
+    body = body.strip()
+    context_mode = _parse_context_mode(meta.get("context_mode"), command_name=command_name)
+    project_reentry_capable = _parse_project_reentry_capable(
+        meta.get("project_reentry_capable"),
+        command_name=command_name,
+        context_mode=context_mode,
+    )
+    try:
+        command_policy = _parse_command_policy(
+            command_policy_value,
+            command_name=command_name,
+            context_mode=context_mode,
+            project_reentry_capable=project_reentry_capable,
+            requires=requires,
+            review_contract=review_contract,
+            explicit=command_policy_explicit,
+        )
+    except ValueError as exc:
+        raise ValueError(f"Invalid command-policy in {path}: {exc}") from exc
+    _validate_write_paper_external_authoring_frontmatter(
+        path,
+        command_name=command_name,
+        context_mode=context_mode,
+        command_policy=command_policy,
+        review_contract=review_contract,
+    )
+    staged_loading = _load_command_staged_loading(path, allowed_tools=allowed_tools)
+    content = _command_model_content(
+        body,
+        review_contract,
+        context_mode=context_mode,
+        project_reentry_capable=project_reentry_capable,
+        agent=agent,
+        allowed_tools=allowed_tools,
+        requires=requires,
+        command_policy=command_policy,
+    )
+    metadata_content = content
+    if staged_loading is not None:
+        metadata_content = "\n\n".join(
+            part for part in (content, _command_workflow_metadata_content(command_name)) if part
+        )
+    spawn_contracts = _parse_spawn_contracts(metadata_content, owner_name=command_name)
+    interactive_spawn_contracts = _parse_interactive_spawn_contracts(metadata_content, owner_name=command_name)
+
+    return CommandDef(
+        name=command_name,
+        description=_parse_frontmatter_string_field(
+            meta.get("description"),
+            field_name="description",
+            owner_name=command_name,
+        ),
+        argument_hint=_parse_frontmatter_string_field(
+            meta.get("argument-hint"),
+            field_name="argument-hint",
+            owner_name=command_name,
+        ),
+        agent=agent,
+        context_mode=context_mode,
+        project_reentry_capable=project_reentry_capable,
+        command_policy=command_policy,
+        requires=requires,
+        allowed_tools=allowed_tools,
+        review_contract=review_contract,
+        help=help_metadata,
+        staged_loading=staged_loading,
+        spawn_contracts=spawn_contracts,
+        interactive_spawn_contracts=interactive_spawn_contracts,
+        content=content,
+        path=str(path),
+        source=source,
+    )
+
+
+def _validate_command_name(path: Path, command: CommandDef) -> None:
+    """Reject command metadata that drifts from its registry filename."""
+    expected_name = f"gpd:{path.stem}"
+    if command.name != expected_name:
+        raise ValueError(
+            f"Command frontmatter name {command.name!r} does not match file stem {path.stem!r}; "
+            f"expected {expected_name!r}"
+        )
+
+
+def _validate_agent_name(path: Path, agent: AgentDef) -> None:
+    """Reject agent metadata that drifts from its registry filename."""
+
+    expected_name = path.stem
+    if agent.name != expected_name:
+        raise ValueError(
+            f"Agent frontmatter name {agent.name!r} does not match file stem {path.stem!r}; expected {expected_name!r}"
+        )
+
+
+def load_agents_from_dir(agents_dir: Path) -> dict[str, AgentDef]:
+    """Parse agent definitions from an arbitrary agents directory."""
+    result: dict[str, AgentDef] = {}
+    if not agents_dir.is_dir():
+        return result
+
+    for path in sorted(agents_dir.glob("*.md")):
+        agent = _parse_agent_file(path, source="agents")
+        _validate_agent_name(path, agent)
+        result[agent.name] = agent
+
+    return result
+
+
+# ─── Cache ───────────────────────────────────────────────────────────────────
+
+
+@dataclass
+class _RegistryCache:
+    """Lazy-loaded, process-lifetime cache of all GPD content."""
+
+    _agents: dict[str, AgentDef] | None = field(default=None, repr=False)
+    _commands: dict[str, CommandDef] | None = field(default=None, repr=False)
+    _skills: dict[str, SkillDef] | None = field(default=None, repr=False)
+
+    def agents(self) -> dict[str, AgentDef]:
+        if self._agents is None:
+            self._agents = _discover_agents()
+        return self._agents
+
+    def commands(self) -> dict[str, CommandDef]:
+        if self._commands is None:
+            self._commands = _discover_commands()
+        return self._commands
+
+    def skills(self) -> dict[str, SkillDef]:
+        if self._skills is None:
+            self._skills = _discover_skills(self.commands(), self.agents())
+        return self._skills
+
+    def invalidate(self) -> None:
+        """Clear cached data (useful in tests or after install)."""
+        self._agents = None
+        self._commands = None
+        self._skills = None
+
+
+_cache = _RegistryCache()
+
+
+# ─── Discovery ───────────────────────────────────────────────────────────────
+
+
+def _discover_agents() -> dict[str, AgentDef]:
+    """Discover all agent definitions from the primary agents/ directory."""
+    return load_agents_from_dir(AGENTS_DIR)
+
+
+def _discover_commands() -> dict[str, CommandDef]:
+    """Discover all command definitions from the primary commands/ directory."""
+    result: dict[str, CommandDef] = {}
+    if COMMANDS_DIR.is_dir():
+        for path in sorted(COMMANDS_DIR.glob("*.md")):
+            cmd = _parse_command_file(path, source="commands")
+            _validate_command_name(path, cmd)
+            result[path.stem] = cmd
+
+    return result
+
+
+_SKILL_CATEGORY_MAP: dict[str, str] = {
+    "gpd-autonomous": "execution",
+    "gpd-digest-knowledge": "research",
+    "gpd-execute": "execution",
+    "gpd-plan-checker": "verification",
+    "gpd-plan": "planning",
+    "gpd-verify": "verification",
+    "gpd-debug": "debugging",
+    "gpd-new": "project",
+    "gpd-write": "paper",
+    "gpd-peer-review": "paper",
+    "gpd-review-knowledge": "research",
+    "gpd-review": "paper",
+    "gpd-paper": "paper",
+    "gpd-literature": "research",
+    "gpd-research": "research",
+    "gpd-discover": "research",
+    "gpd-explain": "help",
+    "gpd-start": "help",
+    "gpd-tour": "help",
+    "gpd-map": "exploration",
+    "gpd-show": "exploration",
+    "gpd-progress": "status",
+    "gpd-health": "diagnostics",
+    "gpd-validate": "verification",
+    "gpd-check": "verification",
+    "gpd-audit": "verification",
+    "gpd-add": "management",
+    "gpd-insert": "management",
+    "gpd-remove": "management",
+    "gpd-merge": "management",
+    "gpd-complete": "management",
+    "gpd-compact": "management",
+    "gpd-pause": "session",
+    "gpd-resume": "session",
+    "gpd-record": "management",
+    "gpd-export": "output",
+    "gpd-arxiv": "output",
+    "gpd-graph": "visualization",
+    "gpd-decisions": "status",
+    "gpd-error-propagation": "analysis",
+    "gpd-error": "diagnostics",
+    "gpd-sensitivity": "analysis",
+    "gpd-numerical": "analysis",
+    "gpd-dimensional": "analysis",
+    "gpd-limiting": "analysis",
+    "gpd-parameter": "analysis",
+    "gpd-compare": "analysis",
+    "gpd-derive": "computation",
+    "gpd-set": "configuration",
+    "gpd-update": "management",
+    "gpd-undo": "management",
+    "gpd-sync": "management",
+    "gpd-branch": "management",
+    "gpd-tangent": "planning",
+    "gpd-respond": "paper",
+    "gpd-reapply": "management",
+    "gpd-regression": "verification",
+    "gpd-quick": "execution",
+    "gpd-help": "help",
+    "gpd-suggest": "help",
+    # Full-name entries for skills not captured by prefix matching.
+    "gpd-bibliographer": "research",
+    "gpd-check-todos": "management",
+    "gpd-consistency-checker": "verification",
+    "gpd-discuss-phase": "planning",
+    "gpd-executor": "execution",
+    "gpd-experiment-designer": "planning",
+    "gpd-explainer": "help",
+    "gpd-list-phase-assumptions": "planning",
+    "gpd-notation-coordinator": "verification",
+    "gpd-phase-researcher": "research",
+    "gpd-project-researcher": "research",
+    "gpd-referee": "paper",
+    "gpd-revise-phase": "management",
+    "gpd-roadmapper": "planning",
+    "gpd-route": "planning",
+    "gpd-slides": "output",
+    "gpd-research-mapper": "exploration",
+    "gpd-verifier": "verification",
+}
+VALID_SKILL_CATEGORIES: tuple[str, ...] = tuple(sorted({*set(_SKILL_CATEGORY_MAP.values()), "other"}))
+
+
+def _infer_skill_category(skill_name: str) -> str:
+    """Infer a user-facing category for a skill name.
+
+    Keys are checked longest-first so that full-name entries (e.g.
+    ``gpd-check-todos``) take priority over shorter prefixes (e.g.
+    ``gpd-check``).
+    """
+    for prefix in sorted(_SKILL_CATEGORY_MAP, key=len, reverse=True):
+        if skill_name.startswith(prefix):
+            return _SKILL_CATEGORY_MAP[prefix]
+    return "other"
+
+
+def skill_categories() -> tuple[str, ...]:
+    """Return the canonical skill-category enum published to shared callers."""
+    return VALID_SKILL_CATEGORIES
+
+
+def _canonical_skill_name_for_command(command: CommandDef) -> str:
+    """Project a command registry entry into the canonical gpd-* skill namespace."""
+    return command.name.replace("gpd:", "gpd-", 1)
+
+
+def _discover_skills(commands: dict[str, CommandDef], agents: dict[str, AgentDef]) -> dict[str, SkillDef]:
+    """Build the canonical registry/MCP skill index from primary commands and agents."""
+    result: dict[str, SkillDef] = {}
+
+    for registry_name, command in sorted(commands.items()):
+        if command.source != "commands":
+            continue
+        skill_name = _canonical_skill_name_for_command(command)
+        if skill_name in result:
+            raise ValueError(f"Duplicate skill name {skill_name!r} from command registry")
+        result[skill_name] = SkillDef(
+            name=skill_name,
+            description=command.description,
+            content=command.content,
+            category=_infer_skill_category(skill_name),
+            path=command.path,
+            source_kind="command",
+            registry_name=registry_name,
+            spawn_contracts=command.spawn_contracts,
+            interactive_spawn_contracts=command.interactive_spawn_contracts,
+        )
+
+    for registry_name, agent in sorted(agents.items()):
+        if agent.source != "agents":
+            continue
+        skill_name = agent.name
+        if skill_name in result:
+            raise ValueError(f"Duplicate skill name {skill_name!r} across commands and agents")
+        result[skill_name] = SkillDef(
+            name=skill_name,
+            description=agent.description,
+            content=agent.system_prompt,
+            category=_infer_skill_category(skill_name),
+            path=agent.path,
+            source_kind="agent",
+            registry_name=registry_name,
+        )
+
+    return result
+
+
+# ─── Public API ──────────────────────────────────────────────────────────────
+
+
+def list_agents() -> list[str]:
+    """Return sorted list of all agent names."""
+    return sorted(_cache.agents())
+
+
+def get_agent(name: str) -> AgentDef:
+    """Get a parsed agent definition by name.
+
+    Raises KeyError if not found.
+    """
+    agents = _cache.agents()
+    if name not in agents:
+        raise KeyError(f"Agent not found: {name}")
+    return agents[name]
+
+
+def _format_command_name(command: CommandDef | str, *, name_format: CommandNameFormat) -> str:
+    """Render a command registry entry in the requested public name shape."""
+    if name_format not in {"slug", "label"}:
+        raise ValueError("name_format must be 'slug' or 'label'")
+
+    if isinstance(command, CommandDef):
+        slug = command_slug_from_label(command.name)
+        label = command.name
+    else:
+        slug = command_slug_from_label(command) or command
+        label = canonical_command_label(command)
+    return slug if name_format == "slug" else label
+
+
+def list_commands(*, name_format: CommandNameFormat = "slug") -> list[str]:
+    """Return sorted command names.
+
+    Defaults to registry slugs. Pass ``name_format="label"`` to receive public
+    ``gpd:<slug>`` command labels.
+    """
+    return sorted(_format_command_name(command, name_format=name_format) for command in _cache.commands().values())
+
+
+def get_command(name: str) -> CommandDef:
+    """Get a parsed command definition by name.
+
+    Raises KeyError if not found.
+    """
+    commands = _cache.commands()
+    parsed = parse_command_label(name)
+    slug = parsed.slug
+    candidates = []
+    for candidate in (
+        parsed.canonical_command,
+        slug,
+    ):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    for candidate in candidates:
+        command = commands.get(candidate)
+        if command is not None:
+            return command
+
+    raise KeyError(f"Command not found: {name}")
+
+
+def list_review_commands(*, name_format: CommandNameFormat = "label") -> list[str]:
+    """Return sorted review-contract command names.
+
+    Defaults to public ``gpd:<slug>`` labels. Pass ``name_format="slug"`` to
+    align with ``list_commands()``'s default registry key shape.
+    """
+    return sorted(
+        _format_command_name(command, name_format=name_format)
+        for command in _cache.commands().values()
+        if command.review_contract is not None
+    )
+
+
+def list_skills() -> list[str]:
+    """Return sorted list of all canonical skill names."""
+    return sorted(_cache.skills())
+
+
+def get_skill(name: str) -> SkillDef:
+    """Get a canonical skill definition by canonical name or registry key."""
+    skills = _cache.skills()
+    slug = command_slug_from_label(name)
+
+    candidates: list[str] = []
+    for candidate in (
+        name.strip(),
+        canonical_skill_label(name),
+        slug,
+        f"gpd-{slug}" if slug else None,
+    ):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    for candidate in candidates:
+        skill = skills.get(candidate)
+        if skill is not None:
+            return skill
+
+    raise KeyError(f"Skill not found: {name}")
+
+
+def invalidate_cache() -> None:
+    """Clear the registry cache. Call after install/uninstall or in tests."""
+    _cache.invalidate()
+    _canonical_agent_names.cache_clear()
+    _builtin_agent_names.cache_clear()
+    invalidate_workflow_stage_manifest_cache()
+
+
+__all__ = [
+    "AGENTS_DIR",
+    "AgentDef",
+    "COMMANDS_DIR",
+    "LOCAL_CLI_BRIDGE_WORKFLOW_EXEMPT_COMMANDS",
+    "CommandDef",
+    "CommandHelpMetadata",
+    "CommandHelpVariant",
+    "CommandOutputPolicy",
+    "CommandPolicy",
+    "CommandSubjectPolicy",
+    "CommandSupportingContextPolicy",
+    "ReviewContractConditionalRequirement",
+    "ReviewContractScopeVariant",
+    "ReviewCommandContract",
+    "SkillDef",
+    "SPECS_DIR",
+    "AGENT_ARTIFACT_WRITE_AUTHORITIES",
+    "AGENT_COMMIT_AUTHORITIES",
+    "AGENT_ROLE_FAMILIES",
+    "AGENT_SHARED_STATE_AUTHORITIES",
+    "AGENT_SURFACES",
+    "VALID_CONTEXT_MODES",
+    "canonical_agent_names",
+    "get_agent",
+    "get_command",
+    "get_skill",
+    "invalidate_cache",
+    "load_agents_from_dir",
+    "list_agents",
+    "list_commands",
+    "list_review_commands",
+    "list_skills",
+    "render_agent_visibility_sections_from_frontmatter",
+    "render_agent_requirements_section",
+    "render_agent_role_kits_section",
+    "render_command_visibility_sections",
+    "render_command_visibility_sections_from_frontmatter",
+    "render_review_contract_section",
+]

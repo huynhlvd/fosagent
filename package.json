@@ -1,0 +1,40 @@
+{
+  "name": "get-physics-done",
+  "version": "1.2.2",
+  "gpdPythonVersion": "1.2.2",
+  "description": "Open-source agentic AI system for physics research across supported AI runtimes",
+  "bin": {
+    "get-physics-done": "bin/install.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "bin/install.js",
+    "src/gpd/bootstrap/installer_metadata.json",
+    "src/gpd/adapters/runtime_catalog.json",
+    "src/gpd/adapters/runtime_catalog_schema.json",
+    "src/gpd/core/public_surface_contract_schema.json",
+    "src/gpd/core/public_surface_contract.json"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/psi-oss/get-physics-done.git"
+  },
+  "homepage": "https://github.com/psi-oss/get-physics-done#readme",
+  "bugs": {
+    "url": "https://github.com/psi-oss/get-physics-done/issues"
+  },
+  "author": "Physical Superintelligence PBC (PSI)",
+  "keywords": [
+    "physical superintelligence",
+    "psi",
+    "physics",
+    "research",
+    "ai",
+    "agentic",
+    "ai runtimes",
+    "runtime adapters"
+  ],
+  "license": "Apache-2.0"
+}

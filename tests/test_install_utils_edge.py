@@ -1,0 +1,1784 @@
+"""Edge-case tests for install_utils.py — covers 5 categories:
+1. expand_at_includes: nested includes, cycles, code fences
+2. parse_jsonc: comments, BOM, trailing commas
+3. write_settings: atomic write
+4. generate_manifest: SHA256 correctness
+5. copy_with_path_replacement: rollback on failure
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from gpd.adapters import get_adapter
+from gpd.adapters.install_utils import (
+    _inject_command_visibility_sections_from_frontmatter,
+    _is_hook_command_for_script,
+    build_hook_command,
+    build_runtime_install_repair_command,
+    cleanup_settings_json_managed_entries,
+    compile_markdown_for_runtime,
+    convert_tool_references_in_body,
+    copy_with_path_replacement,
+    ensure_update_hook,
+    expand_at_includes,
+    finish_install,
+    generate_manifest,
+    get_global_dir,
+    hook_python_interpreter,
+    install_gpd_content,
+    normalize_manifest_relpath,
+    parse_jsonc,
+    pre_install_cleanup,
+    protect_runtime_agent_prompt,
+    read_settings,
+    remove_managed_mcp_server_keys,
+    replace_placeholders,
+    tracked_hook_paths_from_manifest,
+    translate_frontmatter_tool_names,
+    verify_installed,
+    write_manifest,
+    write_settings,
+    write_settings_if_modified_and_prune_empty,
+)
+from gpd.adapters.runtime_catalog import (
+    ManagedInstallSurfacePolicy,
+    get_manifest_metadata_list_policy_key,
+    get_runtime_descriptor,
+    get_runtime_help_example_runtime,
+    get_shared_install_metadata,
+    iter_runtime_descriptors,
+)
+from gpd.core.constants import HOME_DATA_DIR_NAME
+from gpd.core.model_visible_text import SKEPTICAL_RIGOR_GUARDRAILS_HEADING
+
+_RUNTIME_DESCRIPTORS = tuple(iter_runtime_descriptors())
+_SHARED_INSTALL = get_shared_install_metadata()
+_LOCAL_EXAMPLE_RUNTIME = get_runtime_help_example_runtime("local") or _RUNTIME_DESCRIPTORS[0].runtime_name
+_GLOBAL_EXAMPLE_RUNTIME = get_runtime_help_example_runtime("global") or _RUNTIME_DESCRIPTORS[0].runtime_name
+_LOCAL_EXAMPLE_DESCRIPTOR = get_runtime_descriptor(_LOCAL_EXAMPLE_RUNTIME)
+_GLOBAL_EXAMPLE_DESCRIPTOR = get_runtime_descriptor(_GLOBAL_EXAMPLE_RUNTIME)
+_DOLLAR_COMMAND_DESCRIPTOR = next(
+    descriptor for descriptor in _RUNTIME_DESCRIPTORS if descriptor.public_command_surface_prefix.startswith("$")
+)
+_DOLLAR_TEMPLATE_DESCRIPTOR = next(
+    descriptor for descriptor in _RUNTIME_DESCRIPTORS if descriptor.agent_prompt_uses_dollar_templates
+)
+_FLAT_COMMAND_DESCRIPTOR = next(
+    descriptor for descriptor in _RUNTIME_DESCRIPTORS if descriptor.managed_install_surface.flat_command_globs
+)
+_DOLLAR_TEMPLATE_RUNTIMES = tuple(
+    descriptor.runtime_name for descriptor in _RUNTIME_DESCRIPTORS if descriptor.agent_prompt_uses_dollar_templates
+)
+_NON_DOLLAR_TEMPLATE_RUNTIMES = tuple(
+    descriptor.runtime_name for descriptor in _RUNTIME_DESCRIPTORS if not descriptor.agent_prompt_uses_dollar_templates
+)
+
+
+def _bundled_hook_text(name: str) -> str:
+    return (Path(__file__).resolve().parents[1] / "src" / "gpd" / "hooks" / name).read_text(encoding="utf-8")
+
+
+# =========================================================================
+# 1. expand_at_includes
+# =========================================================================
+
+
+def test_get_global_dir_unknown_runtime_raises_keyerror() -> None:
+    with pytest.raises(KeyError, match="Unknown runtime"):
+        get_global_dir("bogus-runtime")
+
+
+def test_replace_placeholders_unknown_runtime_raises_keyerror() -> None:
+    with pytest.raises(KeyError, match="Unknown runtime"):
+        replace_placeholders("{GPD_RUNTIME_FLAG}", "/custom/", "bogus-runtime")
+
+
+def test_build_runtime_install_repair_command_unknown_runtime_raises_keyerror(tmp_path: Path) -> None:
+    with pytest.raises(KeyError, match="Unknown runtime"):
+        build_runtime_install_repair_command("bogus-runtime", install_scope="local", target_dir=tmp_path / ".runtime")
+
+
+def test_replace_placeholders_materializes_shared_install_metadata_placeholders() -> None:
+    content = (
+        "{GPD_BOOTSTRAP_COMMAND}\n"
+        "{GPD_RELEASE_LATEST_URL}\n"
+        "{GPD_RELEASES_API_URL}\n"
+        "{GPD_RELEASES_PAGE_URL}\n"
+        "{GPD_INSTALL_ROOT_DIR_NAME}\n"
+        "{GPD_PATCHES_DIR_NAME}\n"
+    )
+
+    replaced = replace_placeholders(content, "/custom/", _LOCAL_EXAMPLE_RUNTIME, "--local")
+
+    assert _SHARED_INSTALL.bootstrap_command in replaced
+    assert _SHARED_INSTALL.latest_release_url in replaced
+    assert _SHARED_INSTALL.releases_api_url in replaced
+    assert _SHARED_INSTALL.releases_page_url in replaced
+    assert _SHARED_INSTALL.install_root_dir_name in replaced
+    assert _SHARED_INSTALL.patches_dir_name in replaced
+
+
+class TestExpandAtIncludes:
+    """Tests for expand_at_includes: nested includes, cycles, code fences."""
+
+    def _make_src(self, tmp_path: Path, files: dict[str, str]) -> Path:
+        """Create a source tree under tmp_path/get-physics-done/ and return the gpd dir."""
+        gpd_dir = tmp_path / "get-physics-done"
+        gpd_dir.mkdir(parents=True, exist_ok=True)
+        for rel, content in files.items():
+            p = gpd_dir / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
+        return gpd_dir
+
+    def test_simple_include(self, tmp_path: Path) -> None:
+        gpd_dir = self._make_src(tmp_path, {"sub.md": "included body"})
+        content = f"@{tmp_path}/get-physics-done/sub.md"
+        result = expand_at_includes(content, str(gpd_dir), "~/.test/")
+        assert "included body" in result
+        assert "<!-- [included: sub.md] -->" in result
+
+    def test_nested_includes(self, tmp_path: Path) -> None:
+        """Two levels of nesting: A includes B which includes C."""
+        gpd_dir = self._make_src(
+            tmp_path,
+            {
+                "c.md": "leaf content",
+                "b.md": f"before\n@{tmp_path}/get-physics-done/c.md\nafter",
+                "a.md": f"top\n@{tmp_path}/get-physics-done/b.md\nbottom",
+            },
+        )
+        content = f"@{tmp_path}/get-physics-done/b.md"
+        result = expand_at_includes(content, str(gpd_dir), "~/.test/")
+        assert "leaf content" in result
+        assert "before" in result
+
+    def test_cycle_detection(self, tmp_path: Path) -> None:
+        """A includes B, B includes A — should detect cycle."""
+        gpd_dir = self._make_src(
+            tmp_path,
+            {
+                "a.md": f"@{tmp_path}/get-physics-done/b.md",
+                "b.md": f"@{tmp_path}/get-physics-done/a.md",
+            },
+        )
+        content = f"@{tmp_path}/get-physics-done/a.md"
+        result = expand_at_includes(content, str(gpd_dir), "~/.test/")
+        assert "cycle detected" in result
+
+    def test_self_cycle_detection(self, tmp_path: Path) -> None:
+        """File that includes itself."""
+        gpd_dir = self._make_src(
+            tmp_path,
+            {"self.md": f"@{tmp_path}/get-physics-done/self.md"},
+        )
+        content = f"@{tmp_path}/get-physics-done/self.md"
+        result = expand_at_includes(content, str(gpd_dir), "~/.test/")
+        assert "cycle detected" in result
+
+    def test_code_fence_protection(self, tmp_path: Path) -> None:
+        """@include inside code fences should NOT be expanded."""
+        gpd_dir = self._make_src(tmp_path, {"sub.md": "should not appear"})
+        content = f"before\n```\n@{tmp_path}/get-physics-done/sub.md\n```\nafter"
+        result = expand_at_includes(content, str(gpd_dir), "~/.test/")
+        # Original @include line should remain unchanged
+        assert f"@{tmp_path}/get-physics-done/sub.md" in result
+        assert "<!-- [included:" not in result
+
+    def test_code_fence_triple_backtick_with_language(self, tmp_path: Path) -> None:
+        """Code fence with language tag (```python) should still protect."""
+        gpd_dir = self._make_src(tmp_path, {"sub.md": "should not appear"})
+        content = f"```python\n@{tmp_path}/get-physics-done/sub.md\n```\n"
+        result = expand_at_includes(content, str(gpd_dir), "~/.test/")
+        assert "<!-- [included:" not in result
+
+    def test_depth_limit(self, tmp_path: Path) -> None:
+        """Beyond MAX_INCLUDE_EXPANSION_DEPTH, includes are not expanded."""
+        gpd_dir = self._make_src(tmp_path, {"deep.md": "deep content"})
+        content = f"@{tmp_path}/get-physics-done/deep.md"
+        # Start at depth = MAX (10)
+        result = expand_at_includes(content, str(gpd_dir), "~/.test/", depth=10)
+        # At depth=10, function returns content immediately
+        assert "deep content" not in result
+
+    def test_bibtex_not_expanded(self, tmp_path: Path) -> None:
+        """@article{...} should not be treated as an include."""
+        gpd_dir = self._make_src(tmp_path, {})
+        content = '@article{doe2024, title="Test"}'
+        result = expand_at_includes(content, str(gpd_dir), "~/.test/")
+        assert result == content
+
+    def test_missing_file_comment(self, tmp_path: Path) -> None:
+        """Include of a missing file produces a 'not resolved' comment."""
+        gpd_dir = self._make_src(tmp_path, {})
+        content = f"@{tmp_path}/get-physics-done/missing.md"
+        result = expand_at_includes(content, str(gpd_dir), "~/.test/")
+        assert "not resolved" in result
+
+    def test_frontmatter_stripped(self, tmp_path: Path) -> None:
+        """Included file with YAML frontmatter should strip it."""
+        gpd_dir = self._make_src(
+            tmp_path,
+            {"fm.md": "---\ntitle: Test\n---\nactual body"},
+        )
+        content = f"@{tmp_path}/get-physics-done/fm.md"
+        result = expand_at_includes(content, str(gpd_dir), "~/.test/")
+        assert "actual body" in result
+        assert "title: Test" not in result
+
+    def test_frontmatter_with_triple_dash_value_is_stripped_without_corrupting_body(self, tmp_path: Path) -> None:
+        gpd_dir = self._make_src(
+            tmp_path,
+            {"fm.md": "---\ndescription: before --- after\n---\nactual body"},
+        )
+        content = f"@{tmp_path}/get-physics-done/fm.md"
+        result = expand_at_includes(content, str(gpd_dir), "~/.test/")
+        assert "actual body" in result
+        assert "description: before --- after" not in result
+
+    def test_path_replacement_in_included(self, tmp_path: Path) -> None:
+        """Included files should have canonical GPD placeholders replaced."""
+        gpd_dir = self._make_src(
+            tmp_path,
+            {"paths.md": "dir={GPD_INSTALL_DIR} config={GPD_CONFIG_DIR}/foo"},
+        )
+        content = f"@{tmp_path}/get-physics-done/paths.md"
+        result = expand_at_includes(content, str(gpd_dir), "/custom/", runtime=_GLOBAL_EXAMPLE_RUNTIME)
+        assert "dir=/custom/get-physics-done" in result
+        assert "config=/custom/foo" in result
+
+    def test_planning_paths_skipped(self, tmp_path: Path) -> None:
+        """GPD/ paths are project-specific, should not be expanded."""
+        gpd_dir = self._make_src(tmp_path, {})
+        content = "@GPD/research/notes.md"
+        result = expand_at_includes(content, str(gpd_dir), "~/.test/")
+        assert result == content
+
+    def test_example_paths_skipped(self, tmp_path: Path) -> None:
+        """path/ prefixed paths are examples, should not be expanded."""
+        gpd_dir = self._make_src(tmp_path, {})
+        content = "@path/to/example.md"
+        result = expand_at_includes(content, str(gpd_dir), "~/.test/")
+        assert result == content
+
+    def test_no_slash_not_treated_as_include(self, tmp_path: Path) -> None:
+        """@decorator or @mention without / should not be treated as include."""
+        gpd_dir = self._make_src(tmp_path, {})
+        content = "@decorator_name"
+        result = expand_at_includes(content, str(gpd_dir), "~/.test/")
+        assert result == content
+
+    def test_bullet_list_include_is_expanded(self, tmp_path: Path) -> None:
+        gpd_dir = self._make_src(tmp_path, {"workflow.md": "workflow body"})
+        content = f"- @{tmp_path}/get-physics-done/workflow.md (main workflow)"
+        result = expand_at_includes(content, str(gpd_dir), "~/.test/")
+        assert "workflow body" in result
+        assert "<!-- [included: workflow.md] -->" in result
+
+    def test_backticked_bullet_include_with_annotation_is_metadata_only(self, tmp_path: Path) -> None:
+        gpd_dir = self._make_src(tmp_path, {"reference.md": "reference body"})
+        content = f"- `@{tmp_path}/get-physics-done/reference.md` -- Shared reference"
+        result = expand_at_includes(content, str(gpd_dir), "~/.test/")
+        assert result == content
+
+    def test_gpd_agents_dir_include_resolves_from_specs_root(self, tmp_path: Path) -> None:
+        gpd_dir = self._make_src(
+            tmp_path,
+            {
+                "agents/gpd-shared.md": "---\ndescription: shared\n---\nShared agent body\n",
+                "specs/references/ref.md": "ref body\n",
+            },
+        )
+        result = expand_at_includes(
+            "@{GPD_AGENTS_DIR}/gpd-shared.md",
+            gpd_dir / "specs",
+            "/custom/",
+            runtime=_DOLLAR_TEMPLATE_DESCRIPTOR.runtime_name,
+        )
+
+        assert "Shared agent body" in result
+        assert "<!-- [included: gpd-shared.md] -->" in result
+
+    def test_installed_style_nested_get_physics_done_includes_resolve_against_specs_root(self, tmp_path: Path) -> None:
+        gpd_dir = self._make_src(
+            tmp_path,
+            {
+                "templates/schema.md": "Canonical schema body\n",
+                "workflows/verify.md": "@{GPD_INSTALL_DIR}/templates/schema.md\n",
+            },
+        )
+
+        result = expand_at_includes(
+            f"@{tmp_path}/runtime/get-physics-done/workflows/verify.md",
+            gpd_dir,
+            f"{tmp_path}/runtime/",
+            runtime=_LOCAL_EXAMPLE_RUNTIME,
+        )
+
+        assert "Canonical schema body" in result
+        assert "@ include not resolved:" not in result.lower()
+
+
+# =========================================================================
+# 1b. protect_runtime_agent_prompt
+# =========================================================================
+
+
+class TestProtectRuntimeAgentPrompt:
+    """Tests for runtime-specific agent prompt sanitization."""
+
+    def test_rewrites_braced_and_shell_fence_vars_for_dollar_template_runtimes(self) -> None:
+        content = (
+            "---\n"
+            "name: gpd:test\n"
+            "description: test\n"
+            "---\n"
+            "Use ${PHASE_ARG} for planning.\n"
+            "Fallback to ${PHASE_ARG:-plan} when unset.\n"
+            "Strip suffixes with ${FILE%.*} before writing outputs.\n"
+            "Also inspect $ARGUMENTS and store cache metadata in $CACHE.\n"
+            'Use `file_read("$artifact_path")` to inspect the artifact.\n'
+            "\n"
+            "```bash\n"
+            'echo "$phase_dir" "${PHASE_ARG}" "$file"\n'
+            "$gpd-help\n"
+            "echo $phase_number\n"
+            "```\n"
+            "\n"
+            "Physics prose keeps $T$ and $T_N = 0.17(1)$ untouched outside shell examples.\n"
+            "Inline math examples like `$sin(x)$` stay intact.\n"
+        )
+
+        for runtime in _DOLLAR_TEMPLATE_RUNTIMES:
+            result = protect_runtime_agent_prompt(content, runtime)
+            assert "${PHASE_ARG}" not in result
+            assert "${PHASE_ARG:-plan}" not in result
+            assert "${FILE%.*}" not in result
+            assert "$ARGUMENTS" not in result
+            assert "$CACHE" not in result
+            assert "$phase_dir" not in result
+            assert "$file" not in result
+            assert "$phase_number" not in result
+            assert "$artifact_path" not in result
+            assert "<PHASE_ARG>" in result
+            assert "Fallback to <PHASE_ARG> when unset." in result
+            assert "Strip suffixes with <FILE> before writing outputs." in result
+            assert "<ARGUMENTS>" in result
+            assert "<CACHE>" in result
+            assert "<phase_dir>" in result
+            assert "<file>" in result
+            assert "<phase_number>" in result
+            assert "<artifact_path>" in result
+            assert "$gpd-help" in result
+            assert "Physics prose keeps $T$ and $T_N = 0.17(1)$ untouched" in result
+            assert "$T_N = 0.17(1)$" in result
+            assert "`$sin(x)$`" in result
+
+    def test_noop_for_runtimes_without_dollar_template_collision(self) -> None:
+        content = (
+            "---\n"
+            "name: gpd:test\n"
+            "description: test\n"
+            "---\n"
+            "Use ${PHASE_ARG}, ${PHASE_ARG:-plan}, ${FILE%.*}, and $ARGUMENTS.\n"
+            "```bash\n"
+            'echo "$phase_dir"\n'
+            "```\n"
+        )
+
+        for runtime in _NON_DOLLAR_TEMPLATE_RUNTIMES:
+            assert protect_runtime_agent_prompt(content, runtime) == content
+
+
+class TestCommandVisibilityInjection:
+    def test_agent_frontmatter_with_allowed_tools_is_injected_as_agent_surface(self) -> None:
+        content = (
+            "---\nname: gpd-executor\nallowed-tools:\n  - shell\nsurface: internal\nrole_family: worker\n---\nBody.\n"
+        )
+
+        result = _inject_command_visibility_sections_from_frontmatter(content)
+
+        assert "## Agent Requirements" in result
+        assert "## Command Requirements" not in result
+        assert "tools:\n- shell" in result
+        assert result.index("## Agent Requirements") < result.index("Body.")
+
+    def test_requires_only_section_is_injected_once_before_body(self) -> None:
+        content = (
+            "---\n"
+            "requires:\n"
+            "  files:\n"
+            "    - GPD/ROADMAP.md\n"
+            "---\n"
+            "Lead paragraph.\n\n"
+            "## Command Requirements\n\n"
+            "Stale body section.\n"
+        )
+
+        result = _inject_command_visibility_sections_from_frontmatter(content)
+
+        assert result.count("## Command Requirements") == 1
+        assert "## Review Contract" not in result
+        assert result.index("## Command Requirements") < result.index("Lead paragraph.")
+        assert "Stale body section." not in result
+        assert "GPD/ROADMAP.md" in result
+
+    def test_combined_command_visibility_sections_are_deduplicated_and_ordered(self) -> None:
+        content = (
+            "---\n"
+            "requires:\n"
+            "  files:\n"
+            "    - GPD/ROADMAP.md\n"
+            "review-contract:\n"
+            "  schema_version: 1\n"
+            "  review_mode: review\n"
+            "  required_outputs:\n"
+            "    - GPD/review/output.md\n"
+            "---\n"
+            "Lead paragraph.\n\n"
+            "## Review Contract\n\n"
+            "Stale review section.\n\n"
+            "## Command Requirements\n\n"
+            "Stale requirements section.\n"
+        )
+
+        result = _inject_command_visibility_sections_from_frontmatter(content)
+
+        assert result.count("## Command Requirements") == 1
+        assert result.count("## Review Contract") == 1
+        assert result.index("## Command Requirements") < result.index("## Review Contract")
+        assert result.index("## Review Contract") < result.index("Lead paragraph.")
+        assert "Stale review section." not in result
+        assert "Stale requirements section." not in result
+
+    def test_existing_review_contract_section_is_replaced_by_canonical_frontmatter_render(self) -> None:
+        content = (
+            "---\n"
+            "review-contract:\n"
+            "  schema_version: 1\n"
+            "  review_mode: review\n"
+            "  required_outputs:\n"
+            "    - GPD/review/output.md\n"
+            "    - artifact.md\n"
+            "  required_evidence:\n"
+            "    - GPD/review/evidence.md\n"
+            "  blocking_conditions:\n"
+            "    - missing evidence\n"
+            "  preflight_checks:\n"
+            "    - manuscript\n"
+            "  stage_artifacts:\n"
+            "    - artifact.md\n"
+            "  required_state: phase_executed\n"
+            "---\n"
+            "Prose before the existing section.\n\n"
+            "## Review Contract\n\n"
+            "Already present in the body.\n"
+        )
+
+        result = _inject_command_visibility_sections_from_frontmatter(content)
+
+        assert result.count("## Review Contract") == 1
+        assert result.index("## Review Contract") < result.index("Prose before the existing section.")
+        assert "Already present in the body." not in result
+        assert "review_contract:" in result
+        assert "phase_executed" in result
+
+    def test_review_contract_canonical_frontmatter_is_injected_once(self) -> None:
+        content = (
+            "---\n"
+            "review-contract:\n"
+            "  schema_version: 1\n"
+            "  review_mode: review\n"
+            "  required_outputs:\n"
+            "    - GPD/review/output.md\n"
+            "---\n"
+            "Body.\n"
+        )
+
+        result = _inject_command_visibility_sections_from_frontmatter(content)
+
+        assert result.count("## Review Contract") == 1
+        assert "review_contract:" in result
+        assert "review-contract:" not in result[result.index("## Review Contract") :]
+
+    def test_review_contract_injection_preserves_conditional_requirements(self) -> None:
+        content = (
+            "---\n"
+            "review-contract:\n"
+            "  schema_version: 1\n"
+            "  review_mode: publication\n"
+            "  conditional_requirements:\n"
+            "    - when: theorem-bearing claims are present\n"
+            "      required_outputs:\n"
+            "        - GPD/review/PROOF-REDTEAM{round_suffix}.md\n"
+            "---\n"
+            "Body.\n"
+        )
+
+        result = _inject_command_visibility_sections_from_frontmatter(content)
+
+        assert "conditional_requirements:" in result
+        assert "when: theorem-bearing claims are present" in result
+        assert "GPD/review/PROOF-REDTEAM{round_suffix}.md" in result
+
+    def test_review_contract_injection_preserves_crlf_line_endings(self) -> None:
+        content = (
+            "---\r\n"
+            "review-contract:\r\n"
+            "  schema_version: 1\r\n"
+            "  review_mode: review\r\n"
+            "  required_outputs:\r\n"
+            "    - GPD/review/output.md\r\n"
+            "---\r\n"
+            "Body.\r\n"
+        )
+
+        result = _inject_command_visibility_sections_from_frontmatter(content)
+
+        assert "\r\n" in result
+        assert "---\r\n" in result
+        assert "Body.\r\n" in result
+        assert "Body.\r" not in result.replace("Body.\r\n", "")
+
+    def test_review_contract_injection_ignores_fenced_review_contract_heading_markers(self) -> None:
+        content = (
+            "---\n"
+            "review-contract:\n"
+            "  schema_version: 1\n"
+            "  review_mode: review\n"
+            "  required_outputs:\n"
+            "    - GPD/review/output.md\n"
+            "---\n"
+            "```md\n"
+            "## Review Contract\n"
+            "example heading inside a fenced code block\n"
+            "```\n"
+            "\n"
+            "Body.\n"
+        )
+
+        result = _inject_command_visibility_sections_from_frontmatter(content)
+
+        assert result.count("## Review Contract") == 2
+        assert "example heading inside a fenced code block" in result
+        assert result.index("```md") < result.rindex("## Review Contract")
+
+    def test_review_contract_frontmatter_alias_is_rejected_by_install_injection(self) -> None:
+        content = (
+            "---\n"
+            "review_contract:\n"
+            "  schema_version: 1\n"
+            "  review_mode: review\n"
+            "  required_outputs:\n"
+            "    - GPD/review/output.md\n"
+            "---\n"
+            "Body.\n"
+        )
+
+        with pytest.raises(ValueError, match="must use the canonical frontmatter key 'review-contract'"):
+            _inject_command_visibility_sections_from_frontmatter(content)
+
+    def test_compile_markdown_rejects_invalid_review_contract_schema_version(self) -> None:
+        content = "---\nreview-contract:\n  schema_version: true\n  review_mode: review\n---\nPrompt body.\n"
+
+        with pytest.raises(ValueError, match="schema_version(?: .*?)? must be the integer 1"):
+            compile_markdown_for_runtime(
+                content,
+                runtime=_LOCAL_EXAMPLE_RUNTIME,
+                path_prefix=f"/tmp/{_LOCAL_EXAMPLE_DESCRIPTOR.config_dir_name}/",
+            )
+
+
+class TestTranslateFrontmatterToolNames:
+    def test_inline_yaml_array_tools_are_translated(self) -> None:
+        content = "---\nallowed-tools: [Read, Edit]\n---\nBody\n"
+
+        translated = translate_frontmatter_tool_names(
+            content,
+            lambda name: {"Read": "file_read", "Edit": "file_edit"}.get(name),
+        )
+
+        assert "allowed-tools: file_read, file_edit" in translated
+
+    def test_quoted_list_items_are_translated(self) -> None:
+        content = "---\ntools:\n  - \"Read\"\n  - 'Edit'\n---\nBody\n"
+
+        translated = translate_frontmatter_tool_names(
+            content,
+            lambda name: {"Read": "file_read", "Edit": "file_edit"}.get(name),
+        )
+
+        assert "tools:\n  - file_read\n  - file_edit" in translated
+
+    def test_frontmatter_with_literal_delimiter_text_keeps_frontmatter_vars_intact(self) -> None:
+        content = "---\nname: gpd:test\ndescription: keep --- and $HOME literal\n---\nBody uses $USER.\n"
+
+        for runtime in _DOLLAR_TEMPLATE_RUNTIMES:
+            result = protect_runtime_agent_prompt(content, runtime)
+            assert "description: keep --- and $HOME literal" in result
+            assert "Body uses <USER>." in result
+
+
+# =========================================================================
+# 2. parse_jsonc
+# =========================================================================
+
+
+class TestParseJsonc:
+    """Tests for parse_jsonc: comments, BOM, trailing commas."""
+
+    def test_plain_json(self) -> None:
+        result = parse_jsonc('{"key": "value"}')
+        assert result == {"key": "value"}
+
+    def test_single_line_comments(self) -> None:
+        content = '{\n  // This is a comment\n  "key": "value"\n}'
+        result = parse_jsonc(content)
+        assert result == {"key": "value"}
+
+    def test_block_comments(self) -> None:
+        content = '{\n  /* block comment */\n  "key": "value"\n}'
+        result = parse_jsonc(content)
+        assert result == {"key": "value"}
+
+    def test_multiline_block_comment(self) -> None:
+        content = '{\n  /* multi\n     line\n     comment */\n  "key": "value"\n}'
+        result = parse_jsonc(content)
+        assert result == {"key": "value"}
+
+    def test_inline_comment(self) -> None:
+        content = '{\n  "key": "value" // inline comment\n}'
+        result = parse_jsonc(content)
+        assert result == {"key": "value"}
+
+    def test_trailing_comma_object(self) -> None:
+        content = '{\n  "a": 1,\n  "b": 2,\n}'
+        result = parse_jsonc(content)
+        assert result == {"a": 1, "b": 2}
+
+    def test_trailing_comma_array(self) -> None:
+        content = '{"arr": [1, 2, 3,]}'
+        result = parse_jsonc(content)
+        assert result == {"arr": [1, 2, 3]}
+
+    def test_bom_stripped(self) -> None:
+        content = '\ufeff{"key": "value"}'
+        result = parse_jsonc(content)
+        assert result == {"key": "value"}
+
+    def test_comment_inside_string_preserved(self) -> None:
+        """// inside a string is not a comment."""
+        content = '{"url": "https://example.com"}'
+        result = parse_jsonc(content)
+        assert result == {"url": "https://example.com"}
+
+    def test_block_comment_inside_string_preserved(self) -> None:
+        """/* */ inside a string is not a comment."""
+        content = '{"pattern": "/* not a comment */"}'
+        result = parse_jsonc(content)
+        assert result == {"pattern": "/* not a comment */"}
+
+    def test_escaped_quote_in_string(self) -> None:
+        r"""Escaped \" inside a string should not break parsing."""
+        content = r'{"msg": "she said \"hi\""}'
+        result = parse_jsonc(content)
+        assert result == {"msg": 'she said "hi"'}
+
+    def test_all_features_combined(self) -> None:
+        """BOM + comments + trailing commas all at once."""
+        content = '\ufeff{\n  // comment\n  "a": 1,\n  /* block */\n  "b": [1, 2,],\n  "c": "// not a comment",\n}\n'
+        result = parse_jsonc(content)
+        assert result == {"a": 1, "b": [1, 2], "c": "// not a comment"}
+
+    def test_empty_object(self) -> None:
+        assert parse_jsonc("{}") == {}
+
+    def test_nested_objects_with_comments(self) -> None:
+        content = '{\n  "outer": {\n    // inner comment\n    "inner": true,\n  },\n}'
+        result = parse_jsonc(content)
+        assert result == {"outer": {"inner": True}}
+
+    def test_trailing_comma_sanitizer_does_not_mutate_string_literals(self) -> None:
+        content = '{\n  "object_marker": ",}",\n  "array_marker": ",]",\n  "nested": [",}", ",]",],\n}'
+        result = parse_jsonc(content)
+        assert result == {
+            "object_marker": ",}",
+            "array_marker": ",]",
+            "nested": [",}", ",]"],
+        }
+
+    def test_comment_only_lines(self) -> None:
+        content = '// comment\n{"key": 1}\n// trailing'
+        result = parse_jsonc(content)
+        assert result == {"key": 1}
+
+    def test_invalid_json_raises(self) -> None:
+        """parse_jsonc should raise on truly invalid JSON after stripping comments."""
+        with pytest.raises(json.JSONDecodeError):
+            parse_jsonc("{not valid json}")
+
+
+class TestReadSettings:
+    """Tests for read_settings: JSONC support and safe fallback behavior."""
+
+    def test_preserves_valid_jsonc_settings(self, tmp_path: Path) -> None:
+        settings_path = tmp_path / "settings.json"
+        settings_path.write_text(
+            '{\n  // preserve this file\n  "theme": "solarized",\n  "nested": {"enabled": true,},\n}\n',
+            encoding="utf-8",
+        )
+
+        assert read_settings(settings_path) == {
+            "theme": "solarized",
+            "nested": {"enabled": True},
+        }
+
+    def test_preserves_strings_that_look_like_trailing_comma_markers(self, tmp_path: Path) -> None:
+        settings_path = tmp_path / "settings.json"
+        settings_path.write_text('{"marker": ",}", "markers": [",]",],}', encoding="utf-8")
+
+        assert read_settings(settings_path) == {
+            "marker": ",}",
+            "markers": [",]"],
+        }
+
+
+class TestBuildHookCommand:
+    """Tests for build_hook_command: shared interpreter selection."""
+
+    def test_defaults_to_current_python_interpreter(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("GPD_PYTHON", raising=False)
+        monkeypatch.setenv("GPD_HOME", str(tmp_path / "managed-home"))
+        monkeypatch.setattr("gpd.adapters.install_utils.sys.executable", "/custom/venv/bin/python")
+        monkeypatch.setattr("gpd.version.checkout_root", lambda start=None: None)
+
+        command = build_hook_command(
+            tmp_path,
+            "statusline.py",
+            is_global=False,
+            config_dir_name=".runtime",
+        )
+
+        assert command == "/custom/venv/bin/python .runtime/hooks/statusline.py"
+
+    def test_explicit_target_uses_absolute_hook_path(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("GPD_PYTHON", raising=False)
+        monkeypatch.setenv("GPD_HOME", str(tmp_path / "managed-home"))
+        monkeypatch.setattr("gpd.adapters.install_utils.sys.executable", "/custom/venv/bin/python")
+        monkeypatch.setattr("gpd.version.checkout_root", lambda start=None: None)
+
+        command = build_hook_command(
+            tmp_path,
+            "statusline.py",
+            is_global=False,
+            config_dir_name=".runtime",
+            explicit_target=True,
+        )
+
+        expected_path = str(tmp_path / "hooks" / "statusline.py").replace("\\", "/")
+        assert command == f"/custom/venv/bin/python {expected_path}"
+
+    def test_gpd_python_override_beats_other_resolution(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("GPD_PYTHON", "/env/override/python")
+        monkeypatch.setattr("gpd.adapters.install_utils.sys.executable", "/ambient/python")
+
+        assert hook_python_interpreter() == "/env/override/python"
+
+    def test_defaults_to_hidden_home_venv_when_gpd_home_is_unset(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake_home = tmp_path / "home"
+        venv_python_rel = Path("Scripts") / "python.exe" if os.name == "nt" else Path("bin") / "python"
+        managed_python = fake_home / HOME_DATA_DIR_NAME / "venv" / venv_python_rel
+        managed_python.parent.mkdir(parents=True)
+        managed_python.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+
+        monkeypatch.delenv("GPD_PYTHON", raising=False)
+        monkeypatch.delenv("GPD_HOME", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+        monkeypatch.setattr("gpd.adapters.install_utils.sys.executable", "/ambient/python")
+        monkeypatch.setattr("gpd.version.checkout_root", lambda start=None: None)
+        monkeypatch.setattr("gpd.version.resolve_checkout_python", lambda start=None, fallback=None: "/ambient/python")
+
+        assert hook_python_interpreter() == str(managed_python)
+
+    def test_prefers_managed_gpd_python_outside_checkout(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        managed_home = tmp_path / "managed-home"
+        venv_python_rel = Path("Scripts") / "python.exe" if os.name == "nt" else Path("bin") / "python"
+        managed_python = managed_home / "venv" / venv_python_rel
+        managed_python.parent.mkdir(parents=True)
+        managed_python.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+
+        monkeypatch.delenv("GPD_PYTHON", raising=False)
+        monkeypatch.setenv("GPD_HOME", str(managed_home))
+        monkeypatch.setattr("gpd.adapters.install_utils.sys.executable", "/ambient/python")
+        monkeypatch.setattr("gpd.version.checkout_root", lambda start=None: None)
+        monkeypatch.setattr("gpd.version.resolve_checkout_python", lambda start=None, fallback=None: "/ambient/python")
+
+        assert hook_python_interpreter() == str(managed_python)
+
+    def test_outside_checkout_ignores_checkout_python_resolution_semantics(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        managed_home = tmp_path / "managed-home"
+        venv_python_rel = Path("Scripts") / "python.exe" if os.name == "nt" else Path("bin") / "python"
+        managed_python = managed_home / "venv" / venv_python_rel
+        managed_python.parent.mkdir(parents=True)
+        managed_python.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+
+        monkeypatch.delenv("GPD_PYTHON", raising=False)
+        monkeypatch.setenv("GPD_HOME", str(managed_home))
+        monkeypatch.setattr("gpd.adapters.install_utils.sys.executable", "/ambient/python")
+        monkeypatch.setattr("gpd.version.checkout_root", lambda start=None: None)
+        monkeypatch.setattr("gpd.version.resolve_checkout_python", lambda start=None, fallback=None: "/ambient/python")
+
+        assert hook_python_interpreter() == str(managed_python)
+
+    def test_checkout_prefers_checkout_virtualenv_python_over_stale_managed_env(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        managed_home = tmp_path / "managed-home"
+        venv_python_rel = Path("Scripts") / "python.exe" if os.name == "nt" else Path("bin") / "python"
+        managed_python = managed_home / "venv" / venv_python_rel
+        managed_python.parent.mkdir(parents=True)
+        managed_python.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+
+        monkeypatch.delenv("GPD_PYTHON", raising=False)
+        monkeypatch.setenv("GPD_HOME", str(managed_home))
+        checkout_root = tmp_path / "repo"
+        checkout_python = checkout_root / ".venv" / venv_python_rel
+        checkout_python.parent.mkdir(parents=True)
+        checkout_python.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+        monkeypatch.setattr("gpd.adapters.install_utils.sys.executable", "/managed/gpd/venv/bin/python")
+        monkeypatch.setattr("gpd.version.checkout_root", lambda start=None: checkout_root)
+        monkeypatch.setattr(
+            "gpd.version.resolve_checkout_python",
+            lambda start=None, fallback=None: str(checkout_python),
+        )
+
+        assert hook_python_interpreter() == str(checkout_python)
+
+    def test_checkout_falls_back_to_active_python_when_checkout_virtualenv_is_missing(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        managed_home = tmp_path / "managed-home"
+        venv_python_rel = Path("Scripts") / "python.exe" if os.name == "nt" else Path("bin") / "python"
+        managed_python = managed_home / "venv" / venv_python_rel
+        managed_python.parent.mkdir(parents=True)
+        managed_python.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+
+        monkeypatch.delenv("GPD_PYTHON", raising=False)
+        monkeypatch.setenv("GPD_HOME", str(managed_home))
+        monkeypatch.setattr("gpd.adapters.install_utils.sys.executable", "/ambient/python")
+        monkeypatch.setattr("gpd.version.checkout_root", lambda start=None: tmp_path / "repo")
+        monkeypatch.setattr(
+            "gpd.version.resolve_checkout_python",
+            lambda start=None, fallback=None: fallback or "/ambient/python",
+        )
+
+        assert hook_python_interpreter() == "/ambient/python"
+
+
+class TestFinishInstall:
+    """Tests for finish_install: preserve third-party statuslines unless forced."""
+
+    def test_preserves_third_party_statusline_commands(self, tmp_path: Path) -> None:
+        settings_path = tmp_path / ".runtime" / "settings.json"
+        settings_path.parent.mkdir(parents=True)
+        settings_path.write_text(
+            json.dumps(
+                {
+                    "statusLine": {
+                        "type": "command",
+                        "command": "python3 /opt/thirdparty/statusline.py --mode other",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        settings = read_settings(settings_path)
+        finish_install(
+            settings_path,
+            settings,
+            "python3 .claude/hooks/statusline.py",
+            True,
+        )
+
+        updated = json.loads(settings_path.read_text(encoding="utf-8"))
+        assert updated["statusLine"]["command"] == "python3 /opt/thirdparty/statusline.py --mode other"
+
+    def test_forced_install_overwrites_third_party_statusline_commands(self, tmp_path: Path) -> None:
+        settings_path = tmp_path / ".runtime" / "settings.json"
+        settings_path.parent.mkdir(parents=True)
+        settings_path.write_text(
+            json.dumps(
+                {
+                    "statusLine": {
+                        "type": "command",
+                        "command": "python3 /opt/thirdparty/statusline.py --mode other",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        settings = read_settings(settings_path)
+        finish_install(
+            settings_path,
+            settings,
+            "python3 .claude/hooks/statusline.py",
+            True,
+            force_statusline=True,
+        )
+
+        updated = json.loads(settings_path.read_text(encoding="utf-8"))
+        assert updated["statusLine"]["command"] == "python3 .claude/hooks/statusline.py"
+
+
+class TestEnsureUpdateHook:
+    """Tests for managed update-hook repair and deduplication."""
+
+    def test_runtime_context_requires_exact_managed_hook_path_match(self, tmp_path: Path) -> None:
+        config_dir_name = _GLOBAL_EXAMPLE_DESCRIPTOR.config_dir_name
+        target_dir = tmp_path / config_dir_name
+        managed_hook = target_dir / "hooks" / "check_update.py"
+        managed_hook.parent.mkdir(parents=True)
+
+        assert (
+            _is_hook_command_for_script(
+                f"python3 {managed_hook}",
+                "check_update.py",
+                target_dir=target_dir,
+                config_dir_name=config_dir_name,
+            )
+            is True
+        )
+        assert (
+            _is_hook_command_for_script(
+                "python3 check_update.py",
+                "check_update.py",
+                target_dir=target_dir,
+                config_dir_name=config_dir_name,
+            )
+            is False
+        )
+        assert (
+            _is_hook_command_for_script(
+                "python3 /tmp/third-party/hooks/check_update.py",
+                "check_update.py",
+                target_dir=target_dir,
+                config_dir_name=config_dir_name,
+            )
+            is False
+        )
+
+    def test_rewrites_stale_managed_command_and_preserves_other_hooks(self) -> None:
+        config_dir_name = _GLOBAL_EXAMPLE_DESCRIPTOR.config_dir_name
+        stale_command = f"python3 {config_dir_name}/hooks/check_update.py"
+        updated_command = f"/custom/venv/bin/python {config_dir_name}/hooks/check_update.py"
+        settings = {
+            "hooks": {
+                "SessionStart": [
+                    {
+                        "matcher": "startup",
+                        "hooks": [
+                            {"type": "command", "command": stale_command},
+                            {"type": "command", "command": "echo keep-me"},
+                        ],
+                    },
+                    {
+                        "hooks": [
+                            {"type": "command", "command": stale_command},
+                        ]
+                    },
+                ]
+            }
+        }
+
+        ensure_update_hook(settings, updated_command)
+
+        session_start = settings["hooks"]["SessionStart"]
+        assert len(session_start) == 1
+        assert session_start[0]["matcher"] == "startup"
+        commands = [hook["command"] for hook in session_start[0]["hooks"] if isinstance(hook, dict)]
+        assert commands == [
+            updated_command,
+            "echo keep-me",
+        ]
+
+    def test_preserves_third_party_hook_paths_when_runtime_context_is_known(self, tmp_path: Path) -> None:
+        config_dir_name = _GLOBAL_EXAMPLE_DESCRIPTOR.config_dir_name
+        target_dir = tmp_path / config_dir_name
+        target_dir.mkdir(parents=True)
+        stale_command = f"python3 {config_dir_name}/hooks/check_update.py"
+        updated_command = f"/custom/venv/bin/python {config_dir_name}/hooks/check_update.py"
+        settings = {
+            "hooks": {
+                "SessionStart": [
+                    {
+                        "hooks": [
+                            {"type": "command", "command": "python3 /tmp/third-party/hooks/check_update.py"},
+                            {"type": "command", "command": stale_command},
+                        ]
+                    }
+                ]
+            }
+        }
+
+        ensure_update_hook(
+            settings,
+            updated_command,
+            target_dir=target_dir,
+            config_dir_name=config_dir_name,
+        )
+
+        session_start = settings["hooks"]["SessionStart"]
+        commands = [
+            hook["command"]
+            for entry in session_start
+            if isinstance(entry, dict)
+            for hook in entry.get("hooks", [])
+            if isinstance(hook, dict) and isinstance(hook.get("command"), str)
+        ]
+        assert commands == [
+            "python3 /tmp/third-party/hooks/check_update.py",
+            updated_command,
+        ]
+
+
+class TestSettingsCleanupHelpers:
+    """Tests for shared uninstall cleanup of settings-backed runtimes."""
+
+    def test_cleanup_removes_managed_statusline_and_exact_mcp_keys(self, tmp_path: Path) -> None:
+        target_dir = tmp_path / ".runtime"
+        settings = {
+            "statusLine": {
+                "type": "command",
+                "command": f"python3 {target_dir / 'hooks' / 'statusline.py'}",
+            },
+            "mcpServers": {
+                "gpd-state": {"command": "python3", "args": ["-m", "gpd.mcp.servers.state_server"]},
+                "custom-server": {"command": "node", "args": ["custom.js"]},
+            },
+        }
+
+        result = cleanup_settings_json_managed_entries(
+            settings,
+            target_dir=target_dir,
+            config_dir_name=".runtime",
+            session_start_hook_filenames=("check_update.py",),
+            mcp_server_keys=frozenset({"gpd-state"}),
+        )
+
+        assert result.modified is True
+        assert result.removed_statusline is True
+        assert result.removed_mcp_server_keys == ("gpd-state",)
+        assert "statusLine" not in settings
+        assert settings["mcpServers"] == {"custom-server": {"command": "node", "args": ["custom.js"]}}
+
+    def test_cleanup_preserves_unmanaged_statusline_with_matching_basename(self, tmp_path: Path) -> None:
+        target_dir = tmp_path / ".runtime"
+        settings = {
+            "statusLine": {
+                "type": "command",
+                "command": "python3 /tmp/third-party/hooks/statusline.py",
+            }
+        }
+
+        result = cleanup_settings_json_managed_entries(
+            settings,
+            target_dir=target_dir,
+            config_dir_name=".runtime",
+            session_start_hook_filenames=("check_update.py",),
+            mcp_server_keys=frozenset(),
+        )
+
+        assert result.modified is False
+        assert settings["statusLine"]["command"] == "python3 /tmp/third-party/hooks/statusline.py"
+
+    def test_cleanup_preserves_unmanaged_hooks_inside_mixed_sessionstart_entry(self, tmp_path: Path) -> None:
+        target_dir = tmp_path / ".runtime"
+        settings = {
+            "hooks": {
+                "SessionStart": [
+                    {
+                        "matcher": "startup",
+                        "hooks": [
+                            {"type": "command", "command": f"python3 {target_dir / 'hooks' / 'check_update.py'}"},
+                            {"type": "command", "command": "echo keep-me"},
+                            {"type": "command", "command": "python3 /tmp/third-party/hooks/check_update.py"},
+                        ],
+                    },
+                    {"hooks": [{"type": "command", "command": f"python3 {target_dir / 'hooks' / 'statusline.py'}"}]},
+                    {"hooks": [{"type": "command", "command": "echo keep-entry"}]},
+                ],
+                "PostToolUse": [{"hooks": [{"type": "command", "command": "echo keep-other-event"}]}],
+            }
+        }
+
+        result = cleanup_settings_json_managed_entries(
+            settings,
+            target_dir=target_dir,
+            config_dir_name=".runtime",
+            session_start_hook_filenames=("check_update.py", "statusline.py"),
+            mcp_server_keys=frozenset(),
+        )
+
+        assert result.modified is True
+        assert result.removed_session_start_hooks == 2
+        session_start = settings["hooks"]["SessionStart"]
+        commands = [
+            hook["command"]
+            for entry in session_start
+            if isinstance(entry, dict)
+            for hook in entry.get("hooks", [])
+            if isinstance(hook, dict) and isinstance(hook.get("command"), str)
+        ]
+        assert commands == [
+            "echo keep-me",
+            "python3 /tmp/third-party/hooks/check_update.py",
+            "echo keep-entry",
+        ]
+        assert settings["hooks"]["PostToolUse"] == [
+            {"hooks": [{"type": "command", "command": "echo keep-other-event"}]}
+        ]
+
+    def test_remove_managed_mcp_server_keys_preserves_unmanaged_servers(self) -> None:
+        config = {
+            "mcpServers": {
+                "gpd-state": {"command": "python3"},
+                "gpd-wolfram": {"command": "python3"},
+                "custom-server": {"command": "node"},
+            }
+        }
+
+        removed = remove_managed_mcp_server_keys(config, managed_keys=frozenset({"gpd-state", "gpd-wolfram"}))
+
+        assert removed == ("gpd-state", "gpd-wolfram")
+        assert config["mcpServers"] == {"custom-server": {"command": "node"}}
+
+    def test_write_settings_prunes_empty_file_only_when_caller_allows(self, tmp_path: Path) -> None:
+        settings_path = tmp_path / ".runtime" / "settings.json"
+        settings_path.parent.mkdir(parents=True)
+        settings_path.write_text("{}\n", encoding="utf-8")
+
+        assert (
+            write_settings_if_modified_and_prune_empty(
+                settings_path,
+                {},
+                modified=False,
+                prune_empty=False,
+            )
+            is False
+        )
+        assert settings_path.exists()
+
+        assert (
+            write_settings_if_modified_and_prune_empty(
+                settings_path,
+                {},
+                modified=False,
+                prune_empty=True,
+            )
+            is True
+        )
+        assert not settings_path.exists()
+
+
+# =========================================================================
+# 3. write_settings
+# =========================================================================
+
+
+class TestWriteSettings:
+    """Tests for write_settings: atomic write behavior."""
+
+    def test_creates_new_file(self, tmp_path: Path) -> None:
+        target = tmp_path / "settings.json"
+        write_settings(target, {"key": "value"})
+        assert target.exists()
+        data = json.loads(target.read_text(encoding="utf-8"))
+        assert data == {"key": "value"}
+
+    def test_overwrites_existing(self, tmp_path: Path) -> None:
+        target = tmp_path / "settings.json"
+        target.write_text('{"old": true}', encoding="utf-8")
+        write_settings(target, {"new": True})
+        data = json.loads(target.read_text(encoding="utf-8"))
+        assert data == {"new": True}
+        assert "old" not in data
+
+    def test_tmp_file_cleaned_up(self, tmp_path: Path) -> None:
+        """After write, the .tmp file should not remain."""
+        target = tmp_path / "settings.json"
+        write_settings(target, {"key": "value"})
+        tmp_file = target.with_suffix(".tmp")
+        assert not tmp_file.exists()
+
+    def test_output_is_formatted(self, tmp_path: Path) -> None:
+        """Output should be indented JSON with trailing newline."""
+        target = tmp_path / "settings.json"
+        write_settings(target, {"a": 1, "b": 2})
+        content = target.read_text(encoding="utf-8")
+        assert content.endswith("\n")
+        assert "  " in content  # indented
+
+    def test_atomic_semantics_no_partial_write(self, tmp_path: Path) -> None:
+        """If the rename step failed, original file should be untouched."""
+        target = tmp_path / "settings.json"
+        target.write_text('{"original": true}', encoding="utf-8")
+
+        # Patch replace to fail (write_settings uses Path.replace for atomic overwrite)
+        with patch.object(Path, "replace", side_effect=OSError("replace failed")):
+            with pytest.raises(OSError, match="replace failed"):
+                write_settings(target, {"new": True})
+
+        # Original should be intact (write_text succeeded on .tmp, rename failed)
+        data = json.loads(target.read_text(encoding="utf-8"))
+        assert data == {"original": True}
+
+
+# =========================================================================
+# 4. generate_manifest
+# =========================================================================
+
+
+class TestGenerateManifest:
+    """Tests for generate_manifest: SHA256 correctness."""
+
+    def test_empty_directory(self, tmp_path: Path) -> None:
+        d = tmp_path / "empty"
+        d.mkdir()
+        manifest = generate_manifest(d)
+        assert manifest == {}
+
+    def test_nonexistent_directory(self, tmp_path: Path) -> None:
+        manifest = generate_manifest(tmp_path / "nonexistent")
+        assert manifest == {}
+
+    def test_single_file_hash_correct(self, tmp_path: Path) -> None:
+        d = tmp_path / "files"
+        d.mkdir()
+        f = d / "test.txt"
+        f.write_text("hello world", encoding="utf-8")
+
+        expected_hash = hashlib.sha256(b"hello world").hexdigest()
+        manifest = generate_manifest(d)
+        assert manifest == {"test.txt": expected_hash}
+
+    def test_nested_directory_posix_paths(self, tmp_path: Path) -> None:
+        """Paths in manifest should be POSIX-style (forward slashes)."""
+        d = tmp_path / "root"
+        sub = d / "sub" / "deep"
+        sub.mkdir(parents=True)
+        (sub / "file.txt").write_text("nested", encoding="utf-8")
+
+        manifest = generate_manifest(d)
+        assert "sub/deep/file.txt" in manifest
+        assert "\\" not in list(manifest.keys())[0]
+
+    def test_multiple_files_all_hashed(self, tmp_path: Path) -> None:
+        d = tmp_path / "multi"
+        d.mkdir()
+        for name in ["a.txt", "b.txt", "c.txt"]:
+            (d / name).write_text(f"content of {name}", encoding="utf-8")
+
+        manifest = generate_manifest(d)
+        assert len(manifest) == 3
+        for name in ["a.txt", "b.txt", "c.txt"]:
+            expected = hashlib.sha256(f"content of {name}".encode()).hexdigest()
+            assert manifest[name] == expected
+
+    def test_custom_base_dir(self, tmp_path: Path) -> None:
+        """base_dir parameter changes relative path calculation."""
+        base = tmp_path / "base"
+        d = base / "sub"
+        d.mkdir(parents=True)
+        (d / "file.txt").write_text("test", encoding="utf-8")
+
+        manifest = generate_manifest(d, base_dir=base)
+        assert "sub/file.txt" in manifest
+
+    def test_binary_file_hashed_correctly(self, tmp_path: Path) -> None:
+        """Binary files should be hashed correctly."""
+        d = tmp_path / "bin"
+        d.mkdir()
+        data = bytes(range(256))
+        (d / "binary.bin").write_bytes(data)
+
+        expected = hashlib.sha256(data).hexdigest()
+        manifest = generate_manifest(d)
+        assert manifest["binary.bin"] == expected
+
+    def test_sorted_output(self, tmp_path: Path) -> None:
+        """Files should be sorted (since iterdir uses sorted())."""
+        d = tmp_path / "sorted"
+        d.mkdir()
+        for name in ["z.txt", "a.txt", "m.txt"]:
+            (d / name).write_text(name, encoding="utf-8")
+
+        manifest = generate_manifest(d)
+        keys = list(manifest.keys())
+        assert keys == sorted(keys)
+
+
+# =========================================================================
+# 5. copy_with_path_replacement
+# =========================================================================
+
+
+class TestCopyWithPathReplacement:
+    """Tests for copy_with_path_replacement: rollback on failure."""
+
+    def _make_src(self, tmp_path: Path) -> Path:
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "readme.md").write_text(
+            "Config: {GPD_CONFIG_DIR}/foo\nDir: {GPD_INSTALL_DIR}/bar\nAgents: {GPD_AGENTS_DIR}/baz",
+            encoding="utf-8",
+        )
+        (src / "script.sh").write_text("#!/bin/bash\necho ok", encoding="utf-8")
+        return src
+
+    def test_basic_copy(self, tmp_path: Path) -> None:
+        src = self._make_src(tmp_path)
+        dest = tmp_path / "dest"
+        copy_with_path_replacement(src, dest, "/custom/", _GLOBAL_EXAMPLE_RUNTIME)
+
+        assert dest.exists()
+        md_content = (dest / "readme.md").read_text(encoding="utf-8")
+        assert "Config: /custom/foo" in md_content
+        assert "/custom/get-physics-done/bar" in md_content
+        assert "/custom/agents/baz" in md_content
+
+        sh_content = (dest / "script.sh").read_text(encoding="utf-8")
+        assert "echo ok" in sh_content
+
+    def test_dollar_command_runtime_converts_slash_commands_to_public_prefix(self, tmp_path: Path) -> None:
+        """Dollar-command runtimes should convert slash commands to their public prefix."""
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "commands.md").write_text("Use /gpd:execute-phase to run.", encoding="utf-8")
+
+        dest = tmp_path / "dest"
+        copy_with_path_replacement(src, dest, "/custom/", _DOLLAR_COMMAND_DESCRIPTOR.runtime_name)
+
+        content = (dest / "commands.md").read_text(encoding="utf-8")
+        assert f"{_DOLLAR_COMMAND_DESCRIPTOR.public_command_surface_prefix}execute-phase" in content
+        assert "/gpd:" not in content
+
+    def test_function_style_tool_invocations_are_rewritten(self) -> None:
+        """Contextual tool references like task(...) should rewrite cleanly."""
+        content = 'task(prompt="Do work")\nUse shell to run it.\nUse ask_user([{"label": "Yes"}])'
+        result = convert_tool_references_in_body(
+            content,
+            {"task": "Task", "shell": "Bash", "ask_user": "AskUserQuestion"},
+        )
+
+        assert 'Task(prompt="Do work")' in result
+        assert "Use Bash to run it." in result
+        assert 'Use AskUserQuestion([{"label": "Yes"}])' in result
+
+    def test_flat_command_runtime_translates_shared_markdown_content(self, tmp_path: Path) -> None:
+        """Shared content copied for flat-command runtimes should adapt commands and tool names."""
+        adapter = get_adapter(_FLAT_COMMAND_DESCRIPTOR.runtime_name)
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "workflow.md").write_text(
+            'Use ask_user([{"label": "Yes"}])\n'
+            'Launch task(prompt="Run it")\n'
+            "Search with web_search then web_fetch.\n"
+            "Run /gpd:plan-phase 3 next.\n",
+            encoding="utf-8",
+        )
+
+        dest = tmp_path / "dest"
+        copy_with_path_replacement(src, dest, "/custom/", _FLAT_COMMAND_DESCRIPTOR.runtime_name)
+
+        content = (dest / "workflow.md").read_text(encoding="utf-8")
+        assert f'{adapter.translate_tool_name("AskUserQuestion")}([{{"label": "Yes"}}])' in content
+        assert f'{adapter.translate_tool_name("Task")}(prompt="Run it")' in content
+        assert f"{adapter.translate_tool_name('WebSearch')} then {adapter.translate_tool_name('WebFetch')}" in content
+        assert f"{adapter.public_command_surface_prefix}plan-phase 3" in content
+        assert "ask_user(" not in content
+        assert "web_search" not in content
+        assert "/gpd:" not in content
+
+    def test_overwrites_existing_dest(self, tmp_path: Path) -> None:
+        """If dest already exists, it should be replaced."""
+        src = self._make_src(tmp_path)
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        (dest / "old_file.txt").write_text("old", encoding="utf-8")
+
+        copy_with_path_replacement(src, dest, "/custom/", _GLOBAL_EXAMPLE_RUNTIME)
+
+        assert not (dest / "old_file.txt").exists()
+        assert (dest / "readme.md").exists()
+
+    def test_rollback_on_copy_failure(self, tmp_path: Path) -> None:
+        """If copy fails, original dest should remain intact."""
+        src = self._make_src(tmp_path)
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        (dest / "important.txt").write_text("keep me", encoding="utf-8")
+
+        # Patch _copy_dir_contents to fail
+        with patch(
+            "gpd.adapters.install_utils._copy_dir_contents",
+            side_effect=OSError("disk full"),
+        ):
+            with pytest.raises(OSError, match="disk full"):
+                copy_with_path_replacement(src, dest, "/custom/", _GLOBAL_EXAMPLE_RUNTIME)
+
+        # Original dest should be intact
+        assert (dest / "important.txt").exists()
+        assert (dest / "important.txt").read_text() == "keep me"
+
+    def test_no_leftover_tmp_or_old(self, tmp_path: Path) -> None:
+        """After successful copy, no .tmp or .old dirs should remain."""
+        src = self._make_src(tmp_path)
+        dest = tmp_path / "dest"
+        copy_with_path_replacement(src, dest, "/custom/", _GLOBAL_EXAMPLE_RUNTIME)
+
+        pid = os.getpid()
+        assert not (tmp_path / f"dest.tmp.{pid}").exists()
+        assert not (tmp_path / f"dest.old.{pid}").exists()
+
+    def test_nested_directories_copied(self, tmp_path: Path) -> None:
+        """Nested directory structure should be preserved."""
+        src = tmp_path / "src"
+        sub = src / "sub" / "deep"
+        sub.mkdir(parents=True)
+        (sub / "nested.md").write_text("{GPD_CONFIG_DIR}/test", encoding="utf-8")
+        (src / "top.md").write_text("top level", encoding="utf-8")
+
+        dest = tmp_path / "dest"
+        copy_with_path_replacement(src, dest, "/x/", _GLOBAL_EXAMPLE_RUNTIME)
+
+        assert (dest / "top.md").exists()
+        assert (dest / "sub" / "deep" / "nested.md").exists()
+        content = (dest / "sub" / "deep" / "nested.md").read_text(encoding="utf-8")
+        assert "/x/test" in content
+
+    def test_shared_installed_content_skips_prompt_guardrails_while_prompt_surfaces_keep_them(
+        self, tmp_path: Path
+    ) -> None:
+        specs = tmp_path / "specs"
+        for rel in ("references", "templates", "workflows"):
+            (specs / rel).mkdir(parents=True)
+        shared_source = "---\ntitle: Shared content\n---\nBody.\n"
+        (specs / "references" / "reference.md").write_text(shared_source, encoding="utf-8")
+        (specs / "templates" / "template.md").write_text(shared_source, encoding="utf-8")
+        (specs / "workflows" / "workflow.md").write_text(shared_source, encoding="utf-8")
+
+        target = tmp_path / "runtime"
+
+        assert install_gpd_content(specs, target, "/runtime/", _LOCAL_EXAMPLE_RUNTIME) == []
+
+        guardrail_heading = f"## {SKEPTICAL_RIGOR_GUARDRAILS_HEADING}"
+        for rel in (
+            "get-physics-done/references/reference.md",
+            "get-physics-done/templates/template.md",
+            "get-physics-done/workflows/workflow.md",
+        ):
+            assert guardrail_heading not in (target / rel).read_text(encoding="utf-8")
+
+        command_surface = compile_markdown_for_runtime(
+            "---\nname: gpd:test\ndescription: Test command\n---\nCommand body.\n",
+            runtime=_LOCAL_EXAMPLE_RUNTIME,
+            path_prefix="/runtime/",
+        )
+        agent_surface = compile_markdown_for_runtime(
+            "---\nname: gpd-test-agent\ntools:\n  - file_read\n---\nAgent body.\n",
+            runtime=_LOCAL_EXAMPLE_RUNTIME,
+            path_prefix="/runtime/",
+            protect_agent_prompt_body=True,
+        )
+
+        assert guardrail_heading in command_surface
+        assert guardrail_heading in agent_surface
+
+    def test_shared_copy_can_explicitly_opt_into_prompt_guardrails(self, tmp_path: Path) -> None:
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "schema.md").write_text("---\ntitle: Schema\n---\nBody.\n", encoding="utf-8")
+        guardrail_heading = f"## {SKEPTICAL_RIGOR_GUARDRAILS_HEADING}"
+
+        default_dest = tmp_path / "default"
+        copy_with_path_replacement(src, default_dest, "/runtime/", _LOCAL_EXAMPLE_RUNTIME)
+        assert guardrail_heading not in (default_dest / "schema.md").read_text(encoding="utf-8")
+
+        opted_in_dest = tmp_path / "opted-in"
+        copy_with_path_replacement(
+            src,
+            opted_in_dest,
+            "/runtime/",
+            _LOCAL_EXAMPLE_RUNTIME,
+            inject_skeptical_rigor_guardrails=True,
+        )
+        assert guardrail_heading in (opted_in_dest / "schema.md").read_text(encoding="utf-8")
+
+    def test_rollback_on_rename_failure(self, tmp_path: Path) -> None:
+        """If the final rename from tmp to dest fails, old dest should be restored."""
+        src = self._make_src(tmp_path)
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        (dest / "original.txt").write_text("original", encoding="utf-8")
+
+        # We need the first rename (dest -> old) to succeed but the second (tmp -> dest) to fail
+        original_rename = Path.rename
+        call_count = 0
+
+        def patched_rename(self_path, target):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:  # Second rename: tmp -> dest
+                raise OSError("rename failed")
+            return original_rename(self_path, target)
+
+        with patch.object(Path, "rename", patched_rename):
+            with pytest.raises(OSError, match="rename failed"):
+                copy_with_path_replacement(src, dest, "/custom/", _GLOBAL_EXAMPLE_RUNTIME)
+
+        # dest should be restored (old_dir renamed back)
+        assert dest.exists()
+        assert (dest / "original.txt").exists()
+        assert (dest / "original.txt").read_text() == "original"
+
+
+class TestInstallBackupSafety:
+    @pytest.mark.parametrize(
+        "relpath",
+        [
+            "",
+            "/tmp/statusline.py",
+            "C:/Users/example/statusline.py",
+            "../statusline.py",
+            "hooks/../statusline.py",
+            "hooks//statusline.py",
+            "hooks\\..\\statusline.py",
+        ],
+    )
+    def test_manifest_relpath_validator_rejects_escape_forms(self, relpath: str) -> None:
+        assert normalize_manifest_relpath(relpath) is None
+
+    def test_manifest_relpath_validator_accepts_posix_relative_paths(self) -> None:
+        assert normalize_manifest_relpath("hooks/statusline.py") == "hooks/statusline.py"
+
+    def test_write_manifest_tracks_hooks(self, tmp_path: Path) -> None:
+        config_dir = tmp_path / _GLOBAL_EXAMPLE_DESCRIPTOR.config_dir_name
+        (config_dir / "get-physics-done").mkdir(parents=True)
+        (config_dir / "get-physics-done" / "VERSION").write_text("1.0.0", encoding="utf-8")
+        (config_dir / "hooks").mkdir()
+        (config_dir / "hooks" / "statusline.py").write_text(_bundled_hook_text("statusline.py"), encoding="utf-8")
+
+        manifest = write_manifest(config_dir, "1.0.0")
+
+        assert "hooks/statusline.py" in manifest["files"]
+
+    @pytest.mark.parametrize(
+        "reserved_key",
+        [
+            "version",
+            "timestamp",
+            "runtime",
+            "install_scope",
+            "install_target_dir",
+            "explicit_target",
+            "files",
+        ],
+    )
+    def test_write_manifest_rejects_metadata_that_overrides_reserved_contract_fields(
+        self, tmp_path: Path, reserved_key: str
+    ) -> None:
+        config_dir = tmp_path / _GLOBAL_EXAMPLE_DESCRIPTOR.config_dir_name
+        (config_dir / "get-physics-done").mkdir(parents=True)
+
+        with pytest.raises(ValueError, match=f"reserved keys: {reserved_key}"):
+            write_manifest(config_dir, "1.0.0", metadata={reserved_key: "adapter-owned"})
+
+        assert not (config_dir / _SHARED_INSTALL.manifest_name).exists()
+
+    def test_write_manifest_persists_allowed_adapter_metadata(self, tmp_path: Path) -> None:
+        config_dir = tmp_path / _LOCAL_EXAMPLE_DESCRIPTOR.config_dir_name
+        (config_dir / "get-physics-done").mkdir(parents=True)
+        version_file = config_dir / "get-physics-done" / "VERSION"
+        version_file.write_text("1.0.0", encoding="utf-8")
+        generated_skill_dirs_key = get_manifest_metadata_list_policy_key(
+            _LOCAL_EXAMPLE_RUNTIME,
+            value_kind="path_segment",
+            item_prefix="gpd-",
+        )
+
+        metadata = {
+            "managed_config": {"experimental.enableAgents": True},
+            generated_skill_dirs_key: ["gpd-help"],
+        }
+
+        manifest = write_manifest(
+            config_dir,
+            "1.0.0",
+            runtime=_LOCAL_EXAMPLE_RUNTIME,
+            install_scope="local",
+            explicit_target=False,
+            metadata=metadata,
+        )
+        persisted = json.loads((config_dir / _SHARED_INSTALL.manifest_name).read_text(encoding="utf-8"))
+
+        assert manifest["version"] == "1.0.0"
+        assert manifest["runtime"] == _LOCAL_EXAMPLE_RUNTIME
+        assert manifest["install_scope"] == "local"
+        assert manifest["explicit_target"] is False
+        assert manifest["managed_config"] == {"experimental.enableAgents": True}
+        assert manifest[generated_skill_dirs_key] == ["gpd-help"]
+        assert persisted == manifest
+        assert "get-physics-done/VERSION" in persisted["files"]
+
+    def test_manifest_hook_tracking_skips_untrusted_relpaths(self, tmp_path: Path) -> None:
+        config_dir = tmp_path / _GLOBAL_EXAMPLE_DESCRIPTOR.config_dir_name
+        config_dir.mkdir()
+        (config_dir / "gpd-file-manifest.json").write_text(
+            json.dumps(
+                {
+                    "files": {
+                        "hooks/statusline.py": "hash",
+                        "hooks/../../outside.py": "hash",
+                        "hooks\\..\\outside.py": "hash",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        assert tracked_hook_paths_from_manifest(config_dir) == {"hooks/statusline.py"}
+
+    def test_pre_install_cleanup_backs_up_modified_hook_files(self, tmp_path: Path) -> None:
+        config_dir = tmp_path / _GLOBAL_EXAMPLE_DESCRIPTOR.config_dir_name
+        (config_dir / "get-physics-done").mkdir(parents=True)
+        (config_dir / "get-physics-done" / "VERSION").write_text("1.0.0", encoding="utf-8")
+        (config_dir / "hooks").mkdir()
+        hook_path = config_dir / "hooks" / "statusline.py"
+        hook_path.write_text(_bundled_hook_text("statusline.py"), encoding="utf-8")
+
+        write_manifest(config_dir, "1.0.0")
+        hook_path.write_text("print('user edit')\n", encoding="utf-8")
+
+        pre_install_cleanup(config_dir)
+
+        backup_path = config_dir / "gpd-local-patches" / "hooks" / "statusline.py"
+        assert backup_path.exists()
+        assert backup_path.read_text(encoding="utf-8") == "print('user edit')\n"
+        assert not hook_path.exists()
+
+    def test_pre_install_cleanup_does_not_follow_forged_manifest_relpath_outside_target(self, tmp_path: Path) -> None:
+        workspace = tmp_path / "workspace"
+        config_dir = workspace / _GLOBAL_EXAMPLE_DESCRIPTOR.config_dir_name
+        config_dir.mkdir(parents=True)
+        outside = tmp_path / "outside-secret.txt"
+        outside.write_text("do not copy or overwrite\n", encoding="utf-8")
+        (config_dir / "hooks").mkdir()
+        (config_dir / "hooks" / "statusline.py").write_text(_bundled_hook_text("statusline.py"), encoding="utf-8")
+        (config_dir / "gpd-file-manifest.json").write_text(
+            json.dumps(
+                {
+                    "runtime": _GLOBAL_EXAMPLE_RUNTIME,
+                    "install_scope": "local",
+                    "files": {
+                        "../../outside-secret.txt": "forged-hash",
+                        "hooks/statusline.py": "stale-hash",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        pre_install_cleanup(config_dir)
+
+        assert outside.read_text(encoding="utf-8") == "do not copy or overwrite\n"
+        meta = json.loads((config_dir / "gpd-local-patches" / "backup-meta.json").read_text(encoding="utf-8"))
+        assert "../../outside-secret.txt" not in meta["files"]
+        assert "hooks/statusline.py" in meta["files"]
+
+    def test_pre_install_cleanup_replaces_existing_patches_with_fallback_snapshot_when_manifest_is_malformed(
+        self, tmp_path: Path
+    ) -> None:
+        config_dir = tmp_path / _GLOBAL_EXAMPLE_DESCRIPTOR.config_dir_name
+        (config_dir / "get-physics-done").mkdir(parents=True)
+        (config_dir / "get-physics-done" / "VERSION").write_text("1.0.0", encoding="utf-8")
+        (config_dir / "hooks").mkdir()
+        (config_dir / "hooks" / "statusline.py").write_text(_bundled_hook_text("statusline.py"), encoding="utf-8")
+        patches_dir = config_dir / "gpd-local-patches"
+        patches_dir.mkdir()
+        preserved_patch = patches_dir / "backup-meta.json"
+        preserved_patch.write_text('{"files":["hooks/statusline.py"]}', encoding="utf-8")
+        (config_dir / "gpd-file-manifest.json").write_text("{not-json", encoding="utf-8")
+
+        pre_install_cleanup(config_dir)
+
+        backup_path = config_dir / "gpd-local-patches" / "hooks" / "statusline.py"
+        assert preserved_patch.exists()
+        assert '"backup_mode": "fallback-snapshot"' in preserved_patch.read_text(encoding="utf-8")
+        assert backup_path.exists()
+        assert backup_path.read_text(encoding="utf-8") == _bundled_hook_text("statusline.py")
+        assert not (config_dir / "hooks" / "statusline.py").exists()
+
+    def test_pre_install_cleanup_fallback_snapshot_uses_catalog_managed_surface_policy(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config_dir = tmp_path / "runtime-config"
+        managed_files = (
+            config_dir / "runtime-payload" / "VERSION",
+            config_dir / "slash" / "gpd" / "help.md",
+            config_dir / "shortcuts" / "gpd-help.txt",
+            config_dir / "roles" / "gpd-worker.agent",
+        )
+        legacy_hardcoded_files = (
+            config_dir / "commands" / "gpd" / "help.md",
+            config_dir / "command" / "gpd-help.md",
+            config_dir / "agents" / "gpd-worker.md",
+        )
+        for path in (*managed_files, *legacy_hardcoded_files):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f"{path.name}\n", encoding="utf-8")
+        (config_dir / "gpd-file-manifest.json").write_text("{not-json", encoding="utf-8")
+        policy = ManagedInstallSurfacePolicy(
+            gpd_content_globs=("runtime-payload/**/*",),
+            nested_command_globs=("slash/gpd/**/*",),
+            flat_command_globs=("shortcuts/gpd-*.txt",),
+            managed_agent_globs=("roles/gpd-*.agent",),
+        )
+        monkeypatch.setattr(
+            "gpd.adapters.install_utils.get_managed_install_surface_policy",
+            lambda runtime=None: policy,
+        )
+
+        pre_install_cleanup(config_dir)
+
+        patches_dir = config_dir / "gpd-local-patches"
+        assert '"backup_mode": "fallback-snapshot"' in (patches_dir / "backup-meta.json").read_text(encoding="utf-8")
+        for path in managed_files:
+            backup_path = patches_dir / path.relative_to(config_dir)
+            assert backup_path.read_text(encoding="utf-8") == path.read_text(encoding="utf-8")
+        for path in legacy_hardcoded_files:
+            assert not (patches_dir / path.relative_to(config_dir)).exists()
+
+
+def test_verify_installed_rejects_unresolved_include_markers(tmp_path: Path) -> None:
+    install_dir = tmp_path / "installed"
+    install_dir.mkdir()
+    (install_dir / "prompt.md").write_text("<!-- @ include not resolved: foo.md -->\n", encoding="utf-8")
+
+    assert verify_installed(install_dir) is False

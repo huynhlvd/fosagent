@@ -1,0 +1,121 @@
+# Contributing to GPD
+
+Thanks for helping improve Get Physics Done.
+
+GPD is published by Physical Superintelligence PBC (PSI) as an open-source community contribution for physics research workflows. We welcome fixes, tests, documentation improvements, and carefully scoped feature work.
+
+## Contributor License Agreement (CLA)
+
+All contributors must sign a CLA before their pull requests can be merged.
+
+- Individual contributors should review `CLA/GPD_CLA_Individual.pdf`; signing is handled automatically via the CLA Assistant GitHub flow at https://cla-assistant.io/psi-oss/get-physics-done.
+- Corporate contributors, or contributors whose employer owns their IP, should review `CLA/GPD_CLA_Corporate.pdf` and email the signed PDF to legal@psi.inc.
+- Corporate CLA submissions are collected manually and should be logged by the owner of contributor agreement tracking, Ted Grace.
+
+## Before You Start
+
+- Search existing issues and pull requests before opening a new one.
+- For non-trivial changes, open an issue or discussion first so the implementation direction is clear.
+- Keep changes tightly scoped. Small, reviewable pull requests are strongly preferred.
+
+## Development Setup
+
+```bash
+uv sync --dev
+source .venv/bin/activate
+uv tool install pre-commit
+pre-commit install
+```
+
+## Local CLI From This Checkout
+
+Prefer `uv run` from the repo root when you want the local CLI without relying
+on a separately installed `gpd` executable.
+
+```bash
+uv run gpd --help
+uv run gpd install <runtime> --local
+```
+
+Use `codex`, `claude`, `gemini`, or `opencode` for `<runtime>`. After
+`uv sync --dev`, an activated `.venv` can also run `gpd ...` directly.
+
+The tracked pre-commit hook runs `uv run ruff check --fix --unsafe-fixes` on staged Python files.
+
+Useful checks:
+
+```bash
+UV_CACHE_DIR="$(mktemp -d)" UV_NO_CONFIG=1 UV_PYTHON_DOWNLOADS=never uv build
+npm_config_cache="$(mktemp -d)" npm pack --dry-run --json
+pre-commit run --all-files
+uv run python scripts/sync_repo_graph_contract.py --check
+uv run python scripts/render_public_surface.py --check
+uv run python scripts/render_help_surface.py --check
+uv run python scripts/render_bootstrap_installer_metadata.py --check
+uv run pytest -n 0 tests/test_metadata_consistency.py -v
+uv run pytest -n 0 tests/test_release_consistency.py -v
+uv run pytest -n 0 tests/adapters/test_registry.py tests/adapters/test_install_roundtrip.py -v
+uv run pytest -n 0 tests/core/test_cli.py -v
+uv run pytest tests/ -q
+```
+
+If the repo graph check reports generated-artifact drift, repair it separately with
+`uv run python scripts/sync_repo_graph_contract.py`, then review and commit the generated changes.
+If the public surface check reports generated-region drift, repair it separately with
+`uv run python scripts/render_public_surface.py`, then review and commit the generated changes.
+If the help surface check reports generated-region drift, repair it separately with
+`uv run python scripts/render_help_surface.py`, then review and commit the generated changes.
+If the bootstrap installer metadata check reports generated-artifact drift, repair it separately with
+`uv run python scripts/render_bootstrap_installer_metadata.py`, then review and commit the generated changes.
+
+Focused single-file and small targeted checks use `-n 0` so they do not pay xdist startup cost from the global default. `uv run pytest tests/ -q` is the fast local full checked-in suite. GitHub Actions runs the same suite as category-named shards resolved by `tests/ci_sharding.py`; each shard runs `uv run pytest -q --durations=20 --durations-min=1.0 "${PYTEST_TARGETS[@]}"` with a 180 second per-shard budget.
+
+Cross-runtime release checks:
+
+- `tests/adapters/test_registry.py` and `tests/adapters/test_install_roundtrip.py` cover install-time translation across Claude Code, Gemini CLI, Codex, and OpenCode.
+- `tests/core/test_cli.py` covers the public `gpd` CLI surface.
+- `tests/test_metadata_consistency.py` covers public docs, inventory counts, and CLI/registry metadata alignment.
+- `tests/test_release_consistency.py` covers the public install flow, release artifacts, and release-facing messaging.
+- `uv build` validates the published Python wheel and sdist. Use an isolated `UV_CACHE_DIR` with `UV_NO_CONFIG=1` and `UV_PYTHON_DOWNLOADS=never` to match release validation.
+- `npm pack --dry-run --json` validates the published `npx` bootstrap package surface before release. Use a temporary cache outside the repo so the worktree does not gain a local `.npm-cache/`.
+- Gemini public installs are expected to be complete on disk after the CLI-level install path succeeds
+  (`gpd install gemini ...` or `npx -y get-physics-done --gemini ...`): `.gemini/settings.json`
+  should exist with `experimental.enableAgents`, GPD hooks, GPD MCP servers, and `policyPaths`
+  configured, and `policies/gpd-auto-edit.toml` should be present. Raw `GeminiAdapter.install()`
+  prepares deferred settings; adapter-level tests or direct callers must call `finalize_install()`
+  before asserting complete Gemini artifacts.
+- OpenCode installs are expected to leave `opencode.json` complete on disk with GPD-managed `permission.read` / `permission.external_directory` entries and built-in MCP servers under the `mcp` key.
+
+## Sharing Published Research
+
+If you've used GPD to complete and publish a physics paper, we encourage you to share it with the community by opening a pull request. This helps other researchers see real-world examples of GPD workflows and learn from your approach.
+
+**What to include in your PR:**
+
+- A short summary of the physics problem and your approach
+- Which GPD commands and workflows you used (e.g., `gpd:write-paper`, `gpd:verify-work`, `gpd:arxiv-submission`)
+- Key results, figures, or links to the published paper (optional)
+- Any tips or lessons learned that might help others
+
+You don't need to share your full manuscript or data — even a brief write-up with the GPD workflow you followed is valuable.
+
+**Where to add it:** Add your paper to the `README.md` `Papers Using GPD` list. If you want to share more context, include a short case-study note in the PR description or add a doc as part of the same PR. The paper workflows also include reminder text about this in their completion guidance.
+
+## Release-Facing Guardrails
+
+- Public install docs should use `npx -y get-physics-done`.
+- Do not reintroduce stale internal paths such as `packages/gpd` into docs or descriptors.
+- Keep public artifacts present and up to date: `README.md`, `LICENSE`, `CITATION.cff`, `CONTRIBUTING.md`, `package.json`, and `pyproject.toml`.
+- Keep the `tests` workflow pinned to the minimum supported Python version (`3.11`) unless we intentionally broaden CI coverage.
+- Keep `infra/gpd-*.json` synced with the canonical descriptor builder in `src/gpd/mcp/builtin_servers.py`.
+- Keep user-facing validation docs aligned with the CLI surface in `gpd validate`, especially `consistency`, `project-contract`, `review-preflight`, `paper-quality`, `referee-decision`, and `reproducibility-manifest`.
+- Do not commit secrets, private infrastructure details, internal strategy notes, or cached research outputs.
+
+## Pull Request Checklist
+
+- `main` is protected: direct pushes are blocked, and pull requests must pass the required `tests` workflow before merge.
+- Feature and fix PRs must not bump package versions or publish releases.
+- Add public release notes under `## vNEXT` in `CHANGELOG.md` so the release workflows can prepare the next tagged release from reviewed notes.
+- Add or update tests when behavior changes.
+- Update public docs when install flow, commands, or release messaging changes.
+- Keep commit messages concise and descriptive.

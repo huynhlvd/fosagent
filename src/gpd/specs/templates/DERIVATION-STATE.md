@@ -1,0 +1,123 @@
+---
+template_version: 1
+---
+
+# Derivation State Template
+
+Template for `GPD/DERIVATION-STATE.md` — cumulative record of equations, conventions, and intermediate results across all sessions.
+
+**Purpose:** Survive context resets. Each session appends its key equations, conventions, and results here via the pause-work workflow. This file is append-only except during explicit maintenance/pruning workflows, and resume-work reads it without mutation to restore derivation context. It is supporting context for canonical continuation, not a competing authority for project position or resume ranking.
+
+Result IDs are continuity anchors as well as history entries. When a session ends with a persisted canonical derivation, the active rerun anchor should be called out explicitly as `last_result_id` so the next session can reuse it without rediscovering it from prose.
+
+**Relationship to other files:**
+
+- `continue-here.md` is ephemeral (deleted on resume) — its `<persistent_state>` section is extracted and appended here as a projection
+- `STATE.md` tracks position and accumulated context — DERIVATION-STATE.md tracks equations and derivation progress
+- `GPD/state.json` `convention_lock` is the authoritative convention source — DERIVATION-STATE.md records the active lock/projection snapshot used in each session
+
+---
+
+## File Template
+
+```markdown
+---
+last_updated: YYYY-MM-DDTHH:MM:SSZ
+session_count: 0
+total_equations: 0
+---
+
+# Derivation State
+
+Cumulative record of equations, conventions, and intermediate results across all sessions.
+This file is append-only. Pruning rules apply (see bottom). It is a human- and tooling-readable projection of derivation lineage, not the source of truth for resume authority.
+
+---
+
+## Session: {date} — Phase {phase_number}: {phase_name}
+
+**Plan:** {plan_id}
+**Tasks completed:** {task_range}
+
+### Key Equations
+
+1. `{latex_equation}` (units: {units}, valid: {validity_range}, derived from: {source_or_method})
+2. `{latex_equation}` (units: {units}, valid: {validity_range}, derived from: {source_or_method})
+
+### Conventions Active
+
+- Metric: {metric_signature}
+- Fourier: {fourier_convention}
+- Units: {unit_system}
+- Gauge: {gauge_choice} (if applicable)
+- Other: {any_session_specific_conventions}
+
+### Intermediate Results
+
+- {result_id}: {description} — {value_or_expression} (units: {units}, valid: {validity_range})
+- {result_id}: {description} — {value_or_expression} (units: {units}, valid: {validity_range})
+
+### Continuity Anchor
+
+- `last_result_id`: {result_id} (canonical rerun anchor for the most recent persisted derivation)
+
+### Parameter Values
+
+| Parameter | Value | Units | Source |
+|-----------|-------|-------|--------|
+| {name} | {value} | {units} | {how_determined} |
+| {name} | {value} | {units} | {how_determined} |
+
+### Approximations Used
+
+- {approximation_name}: valid when {condition} — checked by {method_or_comparison}
+
+---
+
+[Repeat ## Session blocks for each session...]
+
+---
+
+## Pruning Rules
+
+1. **Maximum 5 sessions retained.** When appending a 6th session, remove the oldest session block.
+2. **Remove completed-phase entries.** When a phase is fully verified and archived (milestone complete), its session entries can be pruned. Key equations should already be in the phase SUMMARY.md.
+3. **Never prune the most recent session** even if its phase is complete — it may contain context needed for the next phase.
+4. **Preserve cross-phase equations.** If an equation from an old session is referenced by `depends_on` in a current intermediate result, do not prune that session.
+5. **Git preserves history.** Pruned content is recoverable via `git log -p -- GPD/DERIVATION-STATE.md`.
+```
+
+<guidelines>
+
+**When this file is created:**
+
+- By the pause-work workflow on first session pause
+- Initialized with frontmatter and empty structure
+
+**When this file is appended to:**
+
+- By pause-work workflow: extracts `<persistent_state>` from `.continue-here.md` and appends as a new Session block
+- Each append increments `session_count` and `total_equations` in frontmatter
+
+**When this file is read:**
+
+- By resume-work workflow: loads full derivation context before resuming and reports cap warnings without mutating the file
+- By execute-plan: optionally references for cross-session equation dependencies
+
+**When this file is pruned:**
+
+- By pause-work or explicit maintenance workflows: applies pruning rules when appending or when the researcher requests maintenance
+- On milestone completion: may remove entries for fully archived phases
+
+**Content quality:**
+
+- Every equation must have explicit units (even "dimensionless") and validity range
+- Convention snapshots must match the convention_lock in state.json at the time of the session
+- Result IDs should match those in state.json intermediate_results, and the active derivation rerun anchor should be repeated explicitly as `last_result_id`
+- Parameter values should include how they were determined (analytical, numerical, from literature)
+
+**Why this matters:**
+
+Physics derivations are stateful — you cannot "rerun" them like code. An equation derived in session 1 is needed in session 5, but the context window between sessions is empty. This file is the bridge. Canonical continuation and execution lineage still own the actual resumable state; this file only preserves derivation context.
+
+</guidelines>
